@@ -300,12 +300,12 @@ with tab_cfg:
     initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=10000000, step=500000)
 
     c3, c4 = st.columns(2)
-    buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=-15.0, step=1.0)
-    sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=14.0, step=1.0)
+    buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=-5.0, step=1.0)
+    sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=5.0, step=1.0)
 
     c5, c6 = st.columns(2)
-    buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=4, step=1)
-    sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=2, step=1)
+    buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=5, step=1)
+    sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=4, step=1)
 
     c7, c8 = st.columns(2)
     rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=12, step=1)
