@@ -30,10 +30,6 @@ st.markdown(
 
 # --- 브라우저 localStorage 자동 저장/복원 브릿지 ---
 def sync_browser_storage(payload_json: str, force_write: bool = False):
-    """
-    앱 시작 시 브라우저 localStorage에 저장된 설정/잔고 데이터를 자동으로 읽어오고,
-    변경 시에는 localStorage에 자동 기록합니다. (URL 주소창은 변경하지 않음)
-    """
     safe_payload = json.dumps(payload_json)
     write_flag = "true" if force_write else "false"
     components.html(
@@ -48,20 +44,25 @@ def sync_browser_storage(payload_json: str, force_write: bool = False):
                 const parentWin = window.parent;
                 const storage = parentWin.localStorage;
 
+                // 브릿지 입력창 부모 컨테이너 완전 숨김 처리
+                const bridgeInputs = parentWin.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
+                if (bridgeInputs.length > 0) {{
+                    const container = bridgeInputs[0].closest('div[data-testid="stTextInput"]');
+                    if (container) {{
+                        container.style.display = "none";
+                    }}
+                }}
+
                 if (forceWrite) {{
                     storage.setItem(STORAGE_KEY, incomingData);
                 }} else {{
                     const saved = storage.getItem(STORAGE_KEY);
-                    if (saved && saved !== incomingData) {{
-                        // 부모 창의 숨겨진 브릿지 입력창에 저장된 JSON 주입 후 이벤트 발생
-                        const bridgeInputs = parentWin.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
-                        if (bridgeInputs.length > 0) {{
-                            const inp = bridgeInputs[0];
-                            const nativeSetter = Object.getOwnPropertyDescriptor(parentWin.HTMLInputElement.prototype, "value").set;
-                            nativeSetter.call(inp, saved);
-                            inp.dispatchEvent(new Event("input", {{ bubbles: true }}));
-                            inp.dispatchEvent(new Event("change", {{ bubbles: true }}));
-                        }}
+                    if (saved && saved !== incomingData && bridgeInputs.length > 0) {{
+                        const inp = bridgeInputs[0];
+                        const nativeSetter = Object.getOwnPropertyDescriptor(parentWin.HTMLInputElement.prototype, "value").set;
+                        nativeSetter.call(inp, saved);
+                        inp.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                        inp.dispatchEvent(new Event("change", {{ bubbles: true }}));
                     }} else if (!saved && incomingData) {{
                         storage.setItem(STORAGE_KEY, incomingData);
                     }}
@@ -107,7 +108,11 @@ def run_upro_simulation(
     use_ma200: bool,
     sgov_rate_pct: float,
     fx_rate: float,
+    threshold_asset: float,
     monthly_deposit: float,
+    monthly_withdrawal: float,
+    extra_cash_amount: float,
+    extra_cash_step: int,
     manual_overrides: dict,
 ):
     raw_df = raw_df.copy()
@@ -162,7 +167,9 @@ def run_upro_simulation(
     sell_step = 1
     last_traded_week = ""
     has_triggered_ma200 = False
+    total_extra_injected = 0.0
     total_monthly_injected = 0.0
+    total_withdrawal = 0.0
 
     cur_week = first_week
     cur_week_high = float(df.loc[0, "High"])
@@ -193,24 +200,59 @@ def run_upro_simulation(
             cur_week_high = max(cur_week_high, high)
             cur_week_low = min(cur_week_low, low)
 
+        # 1. 예수금 일할 이자
         cash += cash * daily_interest
 
+        # 2. 월별 적립금 / 생활비 인출 조건 체크 (시트 원본 동일 로직)
         day_actions = []
-        if dt.month != prev_month and monthly_deposit > 0:
-            cash += monthly_deposit
-            total_monthly_injected += monthly_deposit
-            day_actions.append(f"💰 적립 +{monthly_deposit:,.0f}원")
+        if dt.month != prev_month:
+            current_total_asset = cash + (shares * close * fx_rate)
+            if current_total_asset < threshold_asset:
+                if monthly_deposit > 0:
+                    cash += monthly_deposit
+                    total_monthly_injected += monthly_deposit
+                    day_actions.append(f"💰 적립 +{monthly_deposit:,.0f}원")
+            else:
+                if monthly_withdrawal > 0:
+                    if cash >= monthly_withdrawal:
+                        cash -= monthly_withdrawal
+                        day_actions.append(f"💸 인출 -{monthly_withdrawal:,.0f}원")
+                    else:
+                        needed = monthly_withdrawal - cash
+                        sell_for_withdraw = int(np.ceil(needed / (close * fx_rate)))
+                        cash = 0.0
+                        shares = max(0, shares - sell_for_withdraw)
+                        day_actions.append(f"💸 인출 -{monthly_withdrawal:,.0f}원({sell_for_withdraw}주 매도)")
+                    total_withdrawal += monthly_withdrawal
         prev_month = dt.month
 
         trade_note = ""
 
+        # 3. 수동 실전 잔고 반영 + 매수/매도 분할 단계 자동 보정
         if date_str in manual_overrides:
             ov = manual_overrides[date_str]
-            if int(ov["shares"]) != shares:
+            new_shares = int(ov["shares"])
+            new_cash = float(ov["cash"])
+
+            if new_shares > shares:
+                trade_note = f"✏️ 실전 매수 {buy_step}단계 반영 ({new_shares:,}주 / {new_cash:,.0f}원)"
+                buy_step = min(buy_steps, buy_step + 1)
+                sell_step = 1
                 last_traded_week = week_num
-            shares = int(ov["shares"])
-            cash = float(ov["cash"])
-            trade_note = f"✏️ 실전 반영 ({shares:,}주 / {cash:,.0f}원)"
+            elif new_shares < shares:
+                trade_note = f"✏️ 실전 매도 {sell_step}회차 반영 ({new_shares:,}주 / {new_cash:,.0f}원)"
+                if new_shares == 0:
+                    sell_step = 1
+                else:
+                    sell_step = 1 if sell_step >= sell_steps else sell_step + 1
+                buy_step = 1
+                has_triggered_ma200 = False
+                last_traded_week = week_num
+            else:
+                trade_note = f"✏️ 실전 반영 ({new_shares:,}주 / {new_cash:,.0f}원)"
+
+            shares = new_shares
+            cash = new_cash
         else:
             target_buy = exact_prev_low * buy_band
             target_sell = exact_prev_high * sell_band
@@ -222,6 +264,7 @@ def run_upro_simulation(
                     if prev_row["Close"] <= prev_row["MA200"] and close > ma200:
                         is_cross_ma200 = True
 
+            # 4. 정기 리밸런싱
             if rebalance_months > 0 and (shares > 0 or cash > 0):
                 months_passed = (dt.year - last_reb_year) * 12 + (dt.month - last_reb_month)
                 if months_passed >= rebalance_months:
@@ -236,9 +279,17 @@ def run_upro_simulation(
                     last_traded_week = week_num
                     trade_note = f"⚖️ 정기 리밸런싱({int(stock_ratio_pct)}:{int(100 - stock_ratio_pct)})"
 
+            # 5. 주간 1회 분할 매수(위기 추가 투입 포함) / 200일선 돌파 / 분할 매도
             if trade_note == "" and week_num != last_traded_week:
                 is_grid_buy = low <= target_buy
-                if buy_step <= buy_steps and (is_grid_buy or is_cross_ma200) and cash > 0:
+                can_extra_inject = extra_cash_step > 0 and buy_step == extra_cash_step and extra_cash_amount > 0
+
+                if buy_step <= buy_steps and (is_grid_buy or is_cross_ma200) and (cash > 0 or can_extra_inject):
+                    if can_extra_inject:
+                        cash += extra_cash_amount
+                        total_extra_injected += extra_cash_amount
+                        day_actions.append(f"🆘 위기투입 +{extra_cash_amount:,.0f}원")
+
                     frac = 1.0 / (buy_steps - buy_step + 1)
                     buy_price = close if is_cross_ma200 else target_buy
                     bought = int(np.floor((cash * frac) / (buy_price * fx_rate)))
@@ -270,22 +321,25 @@ def run_upro_simulation(
             trade_note = f"{trade_note} {prefix}".strip()
 
         total_val = cash + (shares * close * fx_rate)
+        real_total_val = total_val + total_withdrawal
         records.append(
             {
                 "날짜": date_str,
                 "종가($)": round(close, 2),
                 "보유수량": shares,
                 "예수금(원)": round(cash),
-                "총자산(원)": round(total_val),
+                "계좌잔고(원)": round(total_val),
+                "누적인출(원)": round(total_withdrawal),
+                "실질총자산(원)": round(real_total_val),
                 "매매기록": trade_note,
             }
         )
 
     res_df = pd.DataFrame(records)
-    res_df["전고점"] = res_df["총자산(원)"].cummax()
+    res_df["전고점"] = res_df["실질총자산(원)"].cummax()
     res_df["낙폭(%)"] = np.where(
         res_df["전고점"] > 0,
-        ((res_df["총자산(원)"] - res_df["전고점"]) / res_df["전고점"]) * 100.0,
+        ((res_df["실질총자산(원)"] - res_df["전고점"]) / res_df["전고점"]) * 100.0,
         0.0,
     )
 
@@ -310,8 +364,8 @@ def run_upro_simulation(
     next_sell_frac = 1.0 if (sell_step == sell_steps or sell_steps == 1) else (1.0 / (sell_steps - sell_step + 1))
     next_sell_qty = max(0, int(np.floor(shares * next_sell_frac)))
 
-    principal = (initial_shares * first_price * fx_rate) + initial_cash + total_monthly_injected
-    final_asset = res_df.iloc[-1]["총자산(원)"]
+    principal = (initial_shares * first_price * fx_rate) + initial_cash + total_monthly_injected + total_extra_injected
+    final_asset = res_df.iloc[-1]["실질총자산(원)"]
     total_ret = ((final_asset - principal) / principal * 100.0) if principal > 0 else 0.0
     days = (df.iloc[-1]["Date"] - df.iloc[0]["Date"]).days
     cagr = ((final_asset / principal) ** (365.25 / days) - 1) * 100.0 if (days > 0 and principal > 0) else 0.0
@@ -329,6 +383,7 @@ def run_upro_simulation(
         "sell_step": sell_step,
         "principal": round(principal),
         "final_asset": round(final_asset),
+        "total_withdrawal": round(total_withdrawal),
         "total_ret": total_ret,
         "cagr": cagr,
         "mdd": mdd,
@@ -365,7 +420,11 @@ DEFAULT_CFG = {
     "use_ma200": True,
     "fx_rate": 1350,
     "sgov_rate_pct": 4.5,
+    "threshold_asset": 100000000,
     "monthly_deposit": 0,
+    "monthly_withdrawal": 0,
+    "extra_cash_amount": 0,
+    "extra_cash_step": 0,
 }
 
 if "manual_overrides" not in st.session_state:
@@ -379,12 +438,12 @@ if "force_storage_write" not in st.session_state:
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-# 숨겨진 브라우저 localStorage 수신용 입력 위젯
+# 브라우저 localStorage 수신용 입력 위젯 (화면 밖 완전 숨김)
 st.markdown(
     """
     <style>
     div[data-testid="stTextInput"]:has(input[aria-label="__storage_bridge__"]) {
-        position: fixed; left: -9999px; top: -9999px; height: 0; overflow: hidden;
+        display: none !important;
     }
     </style>
     """,
@@ -450,7 +509,15 @@ with tab_cfg:
 
     c11, c12 = st.columns(2)
     sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(cfg["sgov_rate_pct"]), step=0.1)
-    monthly_deposit = c12.number_input("월별 적립금 (원)", min_value=0, value=int(cfg["monthly_deposit"]), step=100000)
+    threshold_asset = c12.number_input("적립/인출 기준 자산 (원)", min_value=0, value=int(cfg["threshold_asset"]), step=10000000)
+
+    c13, c14 = st.columns(2)
+    monthly_deposit = c13.number_input("월별 적립금 (기준 미만 시)", min_value=0, value=int(cfg["monthly_deposit"]), step=100000)
+    monthly_withdrawal = c14.number_input("월별 인출금 (기준 이상 시)", min_value=0, value=int(cfg["monthly_withdrawal"]), step=100000)
+
+    c15, c16 = st.columns(2)
+    extra_cash_step = c15.number_input("위기 추가투입 단계 (0=미사용)", min_value=0, max_value=20, value=int(cfg["extra_cash_step"]), step=1)
+    extra_cash_amount = c16.number_input("위기 추가투입금 (원)", min_value=0, value=int(cfg["extra_cash_amount"]), step=500000)
 
     current_cfg = {
         "start_date": start_date.isoformat(),
@@ -465,7 +532,11 @@ with tab_cfg:
         "use_ma200": bool(use_ma200),
         "fx_rate": int(fx_rate),
         "sgov_rate_pct": float(sgov_rate_pct),
+        "threshold_asset": int(threshold_asset),
         "monthly_deposit": int(monthly_deposit),
+        "monthly_withdrawal": int(monthly_withdrawal),
+        "extra_cash_amount": int(extra_cash_amount),
+        "extra_cash_step": int(extra_cash_step),
     }
 
     if current_cfg != st.session_state.saved_cfg:
@@ -534,7 +605,11 @@ res = run_upro_simulation(
     use_ma200=use_ma200,
     sgov_rate_pct=sgov_rate_pct,
     fx_rate=fx_rate,
+    threshold_asset=threshold_asset,
     monthly_deposit=monthly_deposit,
+    monthly_withdrawal=monthly_withdrawal,
+    extra_cash_amount=extra_cash_amount,
+    extra_cash_step=extra_cash_step,
     manual_overrides=st.session_state.manual_overrides,
 )
 
@@ -583,7 +658,7 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 현재 브라우저에 자동 저장되어 다음 접속 시에도 유지됩니다.")
+    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 매수·매도 분할 단계가 자동 보정되고 브라우저에 저장됩니다.")
 
     with st.form("manual_trade_form"):
         m_date = st.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
@@ -607,11 +682,11 @@ with tab_order:
 
 with tab_stats:
     m1, m2 = st.columns(2)
-    m1.metric("최종 평가 자산", f"{res['final_asset']:,}원", f"{res['total_ret']:+.2f}%")
+    m1.metric("실질 총자산", f"{res['final_asset']:,}원", f"{res['total_ret']:+.2f}%")
     m2.metric("연복리 수익률 (CAGR)", f"{res['cagr']:.2f}%", f"MDD {res['mdd']:.2f}%", delta_color="inverse")
 
-    st.write(f"**총 투입 원금:** {res['principal']:,}원")
-    st.line_chart(res["df"].set_index("날짜")[["총자산(원)", "전고점"]])
+    st.write(f"**총 투입 원금:** {res['principal']:,}원 · **누적 인출액:** {res['total_withdrawal']:,}원")
+    st.line_chart(res["df"].set_index("날짜")[["실질총자산(원)", "전고점"]])
 
     st.subheader("최근 매매 및 잔고 내역")
     st.dataframe(
@@ -620,7 +695,6 @@ with tab_stats:
         hide_index=True,
     )
 
-# 브라우저 localStorage와 최종 상태 동기화 실행
 latest_payload = json.dumps(
     {
         "cfg": st.session_state.saved_cfg,
