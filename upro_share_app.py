@@ -1,4 +1,5 @@
 import datetime
+import json
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -26,6 +27,24 @@ st.markdown(
 )
 
 
+# --- URL 쿼리 파라미터로 수동 입력 영구 보존 ---
+def load_overrides_from_url() -> dict:
+    raw = st.query_params.get("ov", "")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def save_overrides_to_url(overrides: dict):
+    if overrides:
+        st.query_params["ov"] = json.dumps(overrides, separators=(",", ":"))
+    elif "ov" in st.query_params:
+        del st.query_params["ov"]
+
+
 @st.cache_data(ttl=3600)
 def load_upro_data() -> pd.DataFrame:
     df = yf.download("UPRO", period="5y", interval="1d", progress=False, auto_adjust=False)
@@ -40,7 +59,7 @@ def load_upro_data() -> pd.DataFrame:
 
 def get_week_key(dt: pd.Timestamp) -> str:
     iso = dt.isocalendar()
-    return f"{iso.year}-{iso.week}"
+    return f"{iso.year}-{iso.week:02d}"
 
 
 def run_upro_simulation(
@@ -63,7 +82,6 @@ def run_upro_simulation(
     raw_df = raw_df.copy()
     raw_df["WeekKey"] = raw_df["Date"].apply(get_week_key)
 
-    # 주간 고/저가 사전 집계 (첫 주 기준값 확보용)
     weekly_stats = (
         raw_df.groupby("WeekKey")
         .agg(High=("High", "max"), Low=("Low", "min"))
@@ -71,7 +89,14 @@ def run_upro_simulation(
     )
     all_weeks = sorted(weekly_stats.keys())
 
-    start_ts = pd.Timestamp(start_date)
+    # 초기 자산이 0이고 수동 입력 기록이 있으면 가장 빠른 수동 입력일부터 시작
+    effective_start = start_date
+    if initial_shares == 0 and initial_cash == 0 and manual_overrides:
+        earliest_ov_date = datetime.date.fromisoformat(min(manual_overrides.keys()))
+        if earliest_ov_date < effective_start:
+            effective_start = earliest_ov_date
+
+    start_ts = pd.Timestamp(effective_start)
     prior_df = raw_df[raw_df["Date"] < start_ts]
     df = raw_df[raw_df["Date"] >= start_ts].reset_index(drop=True)
 
@@ -170,8 +195,8 @@ def run_upro_simulation(
                     if prev_row["Close"] <= prev_row["MA200"] and close > ma200:
                         is_cross_ma200 = True
 
-            # 4. 정기 리밸런싱
-            if rebalance_months > 0:
+            # 4. 정기 리밸런싱 (자산이 있을 때만 실행)
+            if rebalance_months > 0 and (shares > 0 or cash > 0):
                 months_passed = (dt.year - last_reb_year) * 12 + (dt.month - last_reb_month)
                 if months_passed >= rebalance_months:
                     total_asset = cash + (shares * close * fx_rate)
@@ -192,26 +217,28 @@ def run_upro_simulation(
                     frac = 1.0 / (buy_steps - buy_step + 1)
                     buy_price = close if is_cross_ma200 else target_buy
                     bought = int(np.floor((cash * frac) / (buy_price * fx_rate)))
-                    shares += bought
-                    cash -= bought * buy_price * fx_rate
-                    if is_cross_ma200:
-                        has_triggered_ma200 = True
-                    reason = "200일선 돌파" if is_cross_ma200 else f"목표가 ${target_buy:.2f}"
-                    trade_note = f"🟢 매수 {buy_step}단계 ({bought}주 · {reason})"
-                    buy_step += 1
-                    sell_step = 1
-                    last_traded_week = week_num
+                    if bought > 0:
+                        shares += bought
+                        cash -= bought * buy_price * fx_rate
+                        if is_cross_ma200:
+                            has_triggered_ma200 = True
+                        reason = "200일선 돌파" if is_cross_ma200 else f"목표가 ${target_buy:.2f}"
+                        trade_note = f"🟢 매수 {buy_step}단계 ({bought}주 · {reason})"
+                        buy_step += 1
+                        sell_step = 1
+                        last_traded_week = week_num
 
                 elif high >= target_sell and shares > 0:
                     s_frac = 1.0 if (sell_step == sell_steps or sell_steps == 1) else (1.0 / (sell_steps - sell_step + 1))
                     sold = int(np.floor(shares * s_frac))
-                    shares -= sold
-                    cash += sold * target_sell * fx_rate
-                    trade_note = f"🔴 매도 {sell_step}회차 ({sold}주 · 목표가 ${target_sell:.2f})"
-                    last_traded_week = week_num
-                    sell_step = 1 if sell_step >= sell_steps else sell_step + 1
-                    buy_step = 1
-                    has_triggered_ma200 = False
+                    if sold > 0:
+                        shares -= sold
+                        cash += sold * target_sell * fx_rate
+                        trade_note = f"🔴 매도 {sell_step}회차 ({sold}주 · 목표가 ${target_sell:.2f})"
+                        last_traded_week = week_num
+                        sell_step = 1 if sell_step >= sell_steps else sell_step + 1
+                        buy_step = 1
+                        has_triggered_ma200 = False
 
         if day_actions:
             prefix = "[" + " / ".join(day_actions) + "]"
@@ -231,9 +258,12 @@ def run_upro_simulation(
 
     res_df = pd.DataFrame(records)
     res_df["전고점"] = res_df["총자산(원)"].cummax()
-    res_df["낙폭(%)"] = ((res_df["총자산(원)"] - res_df["전고점"]) / res_df["전고점"]) * 100.0
+    res_df["낙폭(%)"] = np.where(
+        res_df["전고점"] > 0,
+        ((res_df["총자산(원)"] - res_df["전고점"]) / res_df["전고점"]) * 100.0,
+        0.0,
+    )
 
-    # 다음 주/이번 주 주문서 기준 주간 고·저가 산출 (미국 뉴욕 시간 기준 주말 판별)
     now_ny = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
     this_week = get_week_key(now_ny)
     is_weekend_or_new_week = (this_week != cur_week) or (now_ny.weekday() >= 5)
@@ -277,7 +307,7 @@ def run_upro_simulation(
 st.title("❄️ UPRO 스노우볼 매매 앱")
 
 if "manual_overrides" not in st.session_state:
-    st.session_state.manual_overrides = {}
+    st.session_state.manual_overrides = load_overrides_from_url()
 
 try:
     raw_df = load_upro_data()
@@ -292,12 +322,18 @@ tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 �
 
 with tab_cfg:
     st.subheader("내 계좌 및 전략 파라미터")
-    default_start = max(raw_df.iloc[0]["Date"].date(), datetime.date.today() - datetime.timedelta(days=365))
-    start_date = st.date_input("투자 시작일", value=default_start, min_value=raw_df.iloc[0]["Date"].date(), max_value=raw_df.iloc[-1]["Date"].date())
+    # 기본값을 오늘(최근 기준일) / 0주 / 0원으로 설정하여 초기 진입 및 초기화 시 0원 상태 유지
+    default_start = raw_df.iloc[-1]["Date"].date()
+    start_date = st.date_input(
+        "투자 시작일",
+        value=default_start,
+        min_value=raw_df.iloc[0]["Date"].date(),
+        max_value=raw_df.iloc[-1]["Date"].date(),
+    )
 
     c1, c2 = st.columns(2)
     initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=0, step=1)
-    initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=10000000, step=500000)
+    initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=0, step=500000)
 
     c3, c4 = st.columns(2)
     buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=-5.0, step=1.0)
@@ -382,7 +418,7 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption("증권사 계좌에서 실제 매매 체결 후 수량과 예수금을 입력하면 이후 주문 수량이 자동 보정됩니다.")
+    st.caption("증권사 계좌에서 실제 매매 체결 후 수량과 예수금을 입력하면 URL에 자동 저장되어 새로고침해도 유지됩니다.")
 
     with st.form("manual_trade_form"):
         m_date = st.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
@@ -395,11 +431,13 @@ with tab_order:
                 "shares": m_shares,
                 "cash": m_cash,
             }
+            save_overrides_to_url(st.session_state.manual_overrides)
             st.rerun()
 
     if st.session_state.manual_overrides:
         if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
             st.session_state.manual_overrides = {}
+            save_overrides_to_url({})
             st.rerun()
 
 with tab_stats:
