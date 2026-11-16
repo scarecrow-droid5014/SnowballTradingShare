@@ -3,6 +3,7 @@ import json
 import numpy as np
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 import yfinance as yf
 
 st.set_page_config(
@@ -25,6 +26,54 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+# --- 브라우저 localStorage 자동 저장/복원 브릿지 ---
+def sync_browser_storage(payload_json: str, force_write: bool = False):
+    """
+    앱 시작 시 브라우저 localStorage에 저장된 설정/잔고 데이터를 자동으로 읽어오고,
+    변경 시에는 localStorage에 자동 기록합니다. (URL 주소창은 변경하지 않음)
+    """
+    safe_payload = json.dumps(payload_json)
+    write_flag = "true" if force_write else "false"
+    components.html(
+        f"""
+        <script>
+        (function() {{
+            const STORAGE_KEY = "upro_snowball_user_state_v1";
+            const incomingData = {safe_payload};
+            const forceWrite = {write_flag};
+
+            try {{
+                const parentWin = window.parent;
+                const storage = parentWin.localStorage;
+
+                if (forceWrite) {{
+                    storage.setItem(STORAGE_KEY, incomingData);
+                }} else {{
+                    const saved = storage.getItem(STORAGE_KEY);
+                    if (saved && saved !== incomingData) {{
+                        // 부모 창의 숨겨진 브릿지 입력창에 저장된 JSON 주입 후 이벤트 발생
+                        const bridgeInputs = parentWin.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
+                        if (bridgeInputs.length > 0) {{
+                            const inp = bridgeInputs[0];
+                            const nativeSetter = Object.getOwnPropertyDescriptor(parentWin.HTMLInputElement.prototype, "value").set;
+                            nativeSetter.call(inp, saved);
+                            inp.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                            inp.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                        }}
+                    }} else if (!saved && incomingData) {{
+                        storage.setItem(STORAGE_KEY, incomingData);
+                    }}
+                }}
+            }} catch (e) {{
+                console.warn("localStorage sync skipped:", e);
+            }}
+        }})();
+        </script>
+        """,
+        height=0,
+    )
 
 
 @st.cache_data(ttl=3600)
@@ -64,7 +113,6 @@ def run_upro_simulation(
     raw_df = raw_df.copy()
     raw_df["WeekKey"] = raw_df["Date"].apply(get_week_key)
 
-    # 주간 전체(월~금) 고/저가 사전 집계
     weekly_stats = (
         raw_df.groupby("WeekKey")
         .agg(High=("High", "max"), Low=("Low", "min"))
@@ -72,7 +120,6 @@ def run_upro_simulation(
     )
     all_weeks = sorted(weekly_stats.keys())
 
-    # 초기 자산이 0이고 수동 입력 기록이 있으면 가장 빠른 수동 입력일부터 시작
     effective_start = start_date
     if initial_shares == 0 and initial_cash == 0 and manual_overrides:
         earliest_ov_date = datetime.date.fromisoformat(min(manual_overrides.keys()))
@@ -146,10 +193,8 @@ def run_upro_simulation(
             cur_week_high = max(cur_week_high, high)
             cur_week_low = min(cur_week_low, low)
 
-        # 1. 예수금 일할 이자
         cash += cash * daily_interest
 
-        # 2. 월별 적립금
         day_actions = []
         if dt.month != prev_month and monthly_deposit > 0:
             cash += monthly_deposit
@@ -159,7 +204,6 @@ def run_upro_simulation(
 
         trade_note = ""
 
-        # 3. 수동 실전 잔고 오버라이드 확인
         if date_str in manual_overrides:
             ov = manual_overrides[date_str]
             if int(ov["shares"]) != shares:
@@ -178,7 +222,6 @@ def run_upro_simulation(
                     if prev_row["Close"] <= prev_row["MA200"] and close > ma200:
                         is_cross_ma200 = True
 
-            # 4. 정기 리밸런싱 (자산이 있을 때만 실행)
             if rebalance_months > 0 and (shares > 0 or cash > 0):
                 months_passed = (dt.year - last_reb_year) * 12 + (dt.month - last_reb_month)
                 if months_passed >= rebalance_months:
@@ -193,7 +236,6 @@ def run_upro_simulation(
                     last_traded_week = week_num
                     trade_note = f"⚖️ 정기 리밸런싱({int(stock_ratio_pct)}:{int(100 - stock_ratio_pct)})"
 
-            # 5. 주간 1회 분할 매수 / 200일선 돌파 / 분할 매도
             if trade_note == "" and week_num != last_traded_week:
                 is_grid_buy = low <= target_buy
                 if buy_step <= buy_steps and (is_grid_buy or is_cross_ma200) and cash > 0:
@@ -296,7 +338,6 @@ def run_upro_simulation(
 # --- UI 렌더링 ---
 st.title("❄️ UPRO 스노우볼 매매 앱")
 
-# 주소창에 남아 있을 수 있는 기존 쿼리 파라미터 정리
 if st.query_params:
     st.query_params.clear()
 
@@ -310,10 +351,6 @@ latest_db_date = raw_df.iloc[-1]["Date"].strftime("%Y-%m-%d")
 min_db_date = raw_df.iloc[0]["Date"].date()
 max_db_date = raw_df.iloc[-1]["Date"].date()
 st.caption(f"야후 파이낸스 UPRO 실시간 연동 · 기준일: {latest_db_date}")
-
-# 세션 상태 초기화
-if "manual_overrides" not in st.session_state:
-    st.session_state.manual_overrides = {}
 
 DEFAULT_CFG = {
     "start_date": max_db_date.isoformat(),
@@ -331,40 +368,50 @@ DEFAULT_CFG = {
     "monthly_deposit": 0,
 }
 
+if "manual_overrides" not in st.session_state:
+    st.session_state.manual_overrides = {}
 if "saved_cfg" not in st.session_state:
     st.session_state.saved_cfg = DEFAULT_CFG.copy()
-
+if "storage_loaded" not in st.session_state:
+    st.session_state.storage_loaded = False
+if "force_storage_write" not in st.session_state:
+    st.session_state.force_storage_write = False
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
+
+# 숨겨진 브라우저 localStorage 수신용 입력 위젯
+st.markdown(
+    """
+    <style>
+    div[data-testid="stTextInput"]:has(input[aria-label="__storage_bridge__"]) {
+        position: fixed; left: -9999px; top: -9999px; height: 0; overflow: hidden;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+bridge_val = st.text_input("__storage_bridge__", key="__storage_bridge__", label_visibility="collapsed")
+
+if bridge_val and not st.session_state.storage_loaded:
+    try:
+        parsed_state = json.loads(bridge_val)
+        if isinstance(parsed_state, dict):
+            if "cfg" in parsed_state:
+                merged = DEFAULT_CFG.copy()
+                merged.update(parsed_state["cfg"])
+                st.session_state.saved_cfg = merged
+            if "overrides" in parsed_state:
+                st.session_state.manual_overrides = parsed_state["overrides"]
+            st.session_state.storage_loaded = True
+            st.rerun()
+    except Exception:
+        pass
 
 tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 투자 설정", "📊 성과 및 기록"])
 
 with tab_cfg:
-    st.subheader("💾 설정 및 매매기록 백업 / 불러오기")
-    st.caption("주소창은 고정된 상태로 유지되며, 설정 파일(.json)로 언제든 내 환경을 저장하고 불러올 수 있습니다.")
-
-    uploaded_file = st.file_uploader(
-        "저장된 설정 파일 불러오기 (.json)",
-        type=["json"],
-        key=f"cfg_uploader_{st.session_state.uploader_key}",
-    )
-    if uploaded_file is not None:
-        try:
-            loaded_data = json.load(uploaded_file)
-            if "cfg" in loaded_data:
-                merged = DEFAULT_CFG.copy()
-                merged.update(loaded_data["cfg"])
-                st.session_state.saved_cfg = merged
-            if "overrides" in loaded_data:
-                st.session_state.manual_overrides = loaded_data["overrides"]
-            st.session_state.uploader_key += 1
-            st.success("설정 및 매매 기록을 성공적으로 불러왔습니다!")
-            st.rerun()
-        except Exception as e:
-            st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
-
-    st.divider()
     st.subheader("내 계좌 및 전략 파라미터")
+    st.caption("모든 설정과 매매 기록은 현재 기기의 브라우저에 자동 저장되며, 앱 실행 시 자동으로 불러옵니다.")
 
     cfg = st.session_state.saved_cfg
     try:
@@ -405,7 +452,6 @@ with tab_cfg:
     sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(cfg["sgov_rate_pct"]), step=0.1)
     monthly_deposit = c12.number_input("월별 적립금 (원)", min_value=0, value=int(cfg["monthly_deposit"]), step=100000)
 
-    # 현재 입력된 설정 동기화
     current_cfg = {
         "start_date": start_date.isoformat(),
         "initial_shares": int(initial_shares),
@@ -421,7 +467,14 @@ with tab_cfg:
         "sgov_rate_pct": float(sgov_rate_pct),
         "monthly_deposit": int(monthly_deposit),
     }
-    st.session_state.saved_cfg = current_cfg
+
+    if current_cfg != st.session_state.saved_cfg:
+        st.session_state.saved_cfg = current_cfg
+        st.session_state.force_storage_write = True
+
+    st.divider()
+    st.subheader("💾 기기 이동용 백업 파일 (선택 사항)")
+    st.caption("PC와 스마트폰 간 데이터를 옮길 때만 파일로 저장/불러오기 하시면 됩니다.")
 
     export_payload = json.dumps(
         {
@@ -433,16 +486,38 @@ with tab_cfg:
     )
 
     st.download_button(
-        label="📥 현재 설정 및 매매기록 파일로 저장 (.json)",
+        label="📥 백업 파일 내보내기 (.json)",
         data=export_payload,
         file_name=f"upro_snowball_{latest_db_date}.json",
         mime="application/json",
         use_container_width=True,
     )
 
+    uploaded_file = st.file_uploader(
+        "백업 파일 불러오기 (.json)",
+        type=["json"],
+        key=f"cfg_uploader_{st.session_state.uploader_key}",
+    )
+    if uploaded_file is not None:
+        try:
+            loaded_data = json.load(uploaded_file)
+            if "cfg" in loaded_data:
+                merged = DEFAULT_CFG.copy()
+                merged.update(loaded_data["cfg"])
+                st.session_state.saved_cfg = merged
+            if "overrides" in loaded_data:
+                st.session_state.manual_overrides = loaded_data["overrides"]
+            st.session_state.force_storage_write = True
+            st.session_state.uploader_key += 1
+            st.success("백업 파일을 불러와 브라우저에 자동 저장했습니다!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+
     if st.button("🔄 모든 설정 및 기록 초기화", use_container_width=True):
         st.session_state.saved_cfg = DEFAULT_CFG.copy()
         st.session_state.manual_overrides = {}
+        st.session_state.force_storage_write = True
         st.rerun()
 
 res = run_upro_simulation(
@@ -508,7 +583,7 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption("실제 매매 체결 후 수량과 예수금을 반영한 뒤 [⚙️ 내 투자 설정] 탭에서 파일로 저장해 두시면 언제든 불러올 수 있습니다.")
+    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 현재 브라우저에 자동 저장되어 다음 접속 시에도 유지됩니다.")
 
     with st.form("manual_trade_form"):
         m_date = st.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
@@ -521,11 +596,13 @@ with tab_order:
                 "shares": m_shares,
                 "cash": m_cash,
             }
+            st.session_state.force_storage_write = True
             st.rerun()
 
     if st.session_state.manual_overrides:
         if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
             st.session_state.manual_overrides = {}
+            st.session_state.force_storage_write = True
             st.rerun()
 
 with tab_stats:
@@ -542,3 +619,14 @@ with tab_stats:
         use_container_width=True,
         hide_index=True,
     )
+
+# 브라우저 localStorage와 최종 상태 동기화 실행
+latest_payload = json.dumps(
+    {
+        "cfg": st.session_state.saved_cfg,
+        "overrides": st.session_state.manual_overrides,
+    },
+    ensure_ascii=False,
+)
+sync_browser_storage(latest_payload, force_write=st.session_state.force_storage_write)
+st.session_state.force_storage_write = False
