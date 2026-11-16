@@ -82,6 +82,7 @@ def run_upro_simulation(
     raw_df = raw_df.copy()
     raw_df["WeekKey"] = raw_df["Date"].apply(get_week_key)
 
+    # 주간 전체(월~금) 고/저가 사전 집계
     weekly_stats = (
         raw_df.groupby("WeekKey")
         .agg(High=("High", "max"), Low=("Low", "min"))
@@ -268,8 +269,16 @@ def run_upro_simulation(
     this_week = get_week_key(now_ny)
     is_weekend_or_new_week = (this_week != cur_week) or (now_ny.weekday() >= 5)
 
-    ref_high = cur_week_high if is_weekend_or_new_week else exact_prev_high
-    ref_low = cur_week_low if is_weekend_or_new_week else exact_prev_low
+    # 루프 내 부분 집계가 아닌 전체 주간 집계(weekly_stats)에서 정확한 고·저가 조회
+    cur_week_full = weekly_stats.get(cur_week, {"High": cur_week_high, "Low": cur_week_low})
+    prev_week_full = {"High": exact_prev_high, "Low": exact_prev_low}
+    if cur_week in all_weeks:
+        c_idx = all_weeks.index(cur_week)
+        if c_idx > 0:
+            prev_week_full = weekly_stats[all_weeks[c_idx - 1]]
+
+    ref_high = cur_week_full["High"] if is_weekend_or_new_week else prev_week_full["High"]
+    ref_low = cur_week_full["Low"] if is_weekend_or_new_week else prev_week_full["Low"]
 
     next_buy_price = ref_low * buy_band
     next_sell_price = ref_high * sell_band
@@ -322,7 +331,6 @@ tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 �
 
 with tab_cfg:
     st.subheader("내 계좌 및 전략 파라미터")
-    # 기본값을 오늘(최근 기준일) / 0주 / 0원으로 설정하여 초기 진입 및 초기화 시 0원 상태 유지
     default_start = raw_df.iloc[-1]["Date"].date()
     start_date = st.date_input(
         "투자 시작일",
