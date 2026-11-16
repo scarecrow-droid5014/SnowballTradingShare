@@ -3,7 +3,6 @@ import json
 import numpy as np
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 import yfinance as yf
 
 st.set_page_config(
@@ -28,59 +27,22 @@ st.markdown(
 )
 
 
-# --- iframe 자체 localStorage 자동 저장/복원 브릿지 (크로스 오리진 차단 회피) ---
-def sync_browser_storage(payload_json: str, mode: str = "read"):
-    """
-    mode == "write": 현재 설정과 잔고 기록을 브라우저 localStorage에 기록
-    mode == "read":  앱 최초 로딩 시 localStorage에 저장된 값을 읽어 브릿지 입력창으로 전달
-    """
-    safe_payload = json.dumps(payload_json)
-    components.html(
-        f"""
-        <script>
-        (function() {{
-            const STORAGE_KEY = "upro_snowball_user_state_v2";
-            const mode = "{mode}";
-            const incomingData = {safe_payload};
+# --- Streamlit 공식 query_params 기반 영구 저장/복원 ---
+def load_json_param(key: str) -> dict:
+    raw = st.query_params.get(key, "")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
 
-            try {{
-                // iframe 자체 origin의 localStorage 사용 (SecurityError 방지)
-                const storage = window.localStorage;
 
-                // 부모 문서의 브릿지 입력창 숨김 처리
-                try {{
-                    const bridgeInputs = window.parent.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
-                    if (bridgeInputs.length > 0) {{
-                        const container = bridgeInputs[0].closest('div[data-testid="stTextInput"]');
-                        if (container) container.style.display = "none";
-                    }}
-                }} catch (ignore) {{}}
-
-                if (mode === "write") {{
-                    storage.setItem(STORAGE_KEY, incomingData);
-                }} else if (mode === "read") {{
-                    const saved = storage.getItem(STORAGE_KEY);
-                    if (saved) {{
-                        const bridgeInputs = window.parent.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
-                        if (bridgeInputs.length > 0) {{
-                            const inp = bridgeInputs[0];
-                            if (inp.value !== saved) {{
-                                const nativeSetter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, "value").set;
-                                nativeSetter.call(inp, saved);
-                                inp.dispatchEvent(new Event("input", {{ bubbles: true }}));
-                                inp.dispatchEvent(new Event("change", {{ bubbles: true }}));
-                            }}
-                        }}
-                    }}
-                }}
-            }} catch (e) {{
-                console.warn("Storage sync error:", e);
-            }}
-        }})();
-        </script>
-        """,
-        height=0,
-    )
+def save_json_param(key: str, data: dict):
+    if data:
+        st.query_params[key] = json.dumps(data, separators=(",", ":"))
+    elif key in st.query_params:
+        del st.query_params[key]
 
 
 @st.cache_data(ttl=3600)
@@ -232,6 +194,7 @@ def run_upro_simulation(
 
         trade_note = ""
 
+        # 수동 실전 잔고 반영 + 매수/매도 분할 단계 자동 보정
         if date_str in manual_overrides:
             ov = manual_overrides[date_str]
             new_shares = int(ov["shares"])
@@ -394,9 +357,6 @@ def run_upro_simulation(
 # --- UI 렌더링 ---
 st.title("❄️ UPRO 스노우볼 매매 앱")
 
-if st.query_params:
-    st.query_params.clear()
-
 try:
     raw_df = load_upro_data()
 except Exception as e:
@@ -409,72 +369,41 @@ max_db_date = raw_df.iloc[-1]["Date"].date()
 st.caption(f"야후 파이낸스 UPRO 실시간 연동 · 기준일: {latest_db_date}")
 
 DEFAULT_CFG = {
-    "start_date": max_db_date.isoformat(),
-    "initial_shares": 0,
-    "initial_cash": 0,
-    "buy_band_pct": -5.0,
-    "sell_band_pct": 5.0,
-    "buy_steps": 5,
-    "sell_steps": 4,
-    "rebalance_months": 12,
-    "stock_ratio_pct": 50,
-    "use_ma200": True,
-    "fx_rate": 1350,
-    "sgov_rate_pct": 4.5,
-    "threshold_asset": 100000000,
-    "monthly_deposit": 0,
-    "monthly_withdrawal": 0,
-    "extra_cash_amount": 0,
-    "extra_cash_step": 0,
+    "sd": max_db_date.isoformat(),
+    "sh": 0,
+    "ca": 0,
+    "bb": -5.0,
+    "sb": 5.0,
+    "bs": 5,
+    "ss": 4,
+    "rm": 12,
+    "sr": 50,
+    "ma": True,
+    "fx": 1350,
+    "sg": 4.5,
+    "th": 100000000,
+    "md": 0,
+    "mw": 0,
+    "ea": 0,
+    "es": 0,
 }
 
 if "manual_overrides" not in st.session_state:
-    st.session_state.manual_overrides = {}
-if "saved_cfg" not in st.session_state:
-    st.session_state.saved_cfg = DEFAULT_CFG.copy()
-if "storage_loaded" not in st.session_state:
-    st.session_state.storage_loaded = False
-if "pending_write" not in st.session_state:
-    st.session_state.pending_write = False
+    st.session_state.manual_overrides = load_json_param("ov")
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-st.markdown(
-    """
-    <style>
-    div[data-testid="stTextInput"]:has(input[aria-label="__storage_bridge__"]) {
-        display: none !important;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-bridge_val = st.text_input("__storage_bridge__", key="__storage_bridge__", label_visibility="collapsed")
-
-if bridge_val and not st.session_state.storage_loaded:
-    try:
-        parsed_state = json.loads(bridge_val)
-        if isinstance(parsed_state, dict):
-            if "cfg" in parsed_state:
-                merged = DEFAULT_CFG.copy()
-                merged.update(parsed_state["cfg"])
-                st.session_state.saved_cfg = merged
-            if "overrides" in parsed_state:
-                st.session_state.manual_overrides = parsed_state["overrides"]
-            st.session_state.storage_loaded = True
-            st.rerun()
-    except Exception:
-        pass
+saved_cfg = DEFAULT_CFG.copy()
+saved_cfg.update(load_json_param("cfg"))
 
 tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 투자 설정", "📊 성과 및 기록"])
 
 with tab_cfg:
     st.subheader("내 계좌 및 전략 파라미터")
-    st.caption("파라미터를 변경한 뒤 아래 [💾 투자 설정 저장하기] 버튼을 누르면 브라우저에 영구 저장됩니다.")
+    st.caption("파라미터를 변경한 뒤 [💾 투자 설정 저장하기]를 누르면 새로고침해도 계속 유지됩니다.")
 
-    cfg = st.session_state.saved_cfg
     try:
-        parsed_sd = datetime.date.fromisoformat(cfg["start_date"])
+        parsed_sd = datetime.date.fromisoformat(saved_cfg["sd"])
         default_start = min(max(parsed_sd, min_db_date), max_db_date)
     except Exception:
         default_start = max_db_date
@@ -488,69 +417,71 @@ with tab_cfg:
         )
 
         c1, c2 = st.columns(2)
-        initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(cfg["initial_shares"]), step=1)
-        initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(cfg["initial_cash"]), step=500000)
+        initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(saved_cfg["sh"]), step=1)
+        initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(saved_cfg["ca"]), step=500000)
 
         c3, c4 = st.columns(2)
-        buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(cfg["buy_band_pct"]), step=1.0)
-        sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=float(cfg["sell_band_pct"]), step=1.0)
+        buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(saved_cfg["bb"]), step=1.0)
+        sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=float(saved_cfg["sb"]), step=1.0)
 
         c5, c6 = st.columns(2)
-        buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=int(cfg["buy_steps"]), step=1)
-        sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=int(cfg["sell_steps"]), step=1)
+        buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=int(saved_cfg["bs"]), step=1)
+        sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=int(saved_cfg["ss"]), step=1)
 
         c7, c8 = st.columns(2)
-        rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=int(cfg["rebalance_months"]), step=1)
-        stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=int(cfg["stock_ratio_pct"]), step=5)
+        rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=int(saved_cfg["rm"]), step=1)
+        stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=int(saved_cfg["sr"]), step=5)
 
         c9, c10 = st.columns(2)
-        ma200_idx = 0 if cfg["use_ma200"] else 1
+        ma200_idx = 0 if saved_cfg["ma"] else 1
         use_ma200 = c9.selectbox("200일선 상향 돌파 매수", options=[True, False], index=ma200_idx, format_func=lambda x: "사용함" if x else "미사용")
-        fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=int(cfg["fx_rate"]), step=10)
+        fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=int(saved_cfg["fx"]), step=10)
 
         c11, c12 = st.columns(2)
-        sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(cfg["sgov_rate_pct"]), step=0.1)
-        threshold_asset = c12.number_input("적립/인출 기준 자산 (원)", min_value=0, value=int(cfg["threshold_asset"]), step=10000000)
+        sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(saved_cfg["sg"]), step=0.1)
+        threshold_asset = c12.number_input("적립/인출 기준 자산 (원)", min_value=0, value=int(saved_cfg["th"]), step=10000000)
 
         c13, c14 = st.columns(2)
-        monthly_deposit = c13.number_input("월별 적립금 (기준 미만 시)", min_value=0, value=int(cfg["monthly_deposit"]), step=100000)
-        monthly_withdrawal = c14.number_input("월별 인출금 (기준 이상 시)", min_value=0, value=int(cfg["monthly_withdrawal"]), step=100000)
+        monthly_deposit = c13.number_input("월별 적립금 (기준 미만 시)", min_value=0, value=int(saved_cfg["md"]), step=100000)
+        monthly_withdrawal = c14.number_input("월별 인출금 (기준 이상 시)", min_value=0, value=int(saved_cfg["mw"]), step=100000)
 
         c15, c16 = st.columns(2)
-        extra_cash_step = c15.number_input("위기 추가투입 단계 (0=미사용)", min_value=0, max_value=20, value=int(cfg["extra_cash_step"]), step=1)
-        extra_cash_amount = c16.number_input("위기 추가투입금 (원)", min_value=0, value=int(cfg["extra_cash_amount"]), step=500000)
+        extra_cash_step = c15.number_input("위기 추가투입 단계 (0=미사용)", min_value=0, max_value=20, value=int(saved_cfg["es"]), step=1)
+        extra_cash_amount = c16.number_input("위기 추가투입금 (원)", min_value=0, value=int(saved_cfg["ea"]), step=500000)
 
         save_cfg_btn = st.form_submit_button("💾 투자 설정 저장하기", use_container_width=True)
         if save_cfg_btn:
-            st.session_state.saved_cfg = {
-                "start_date": start_date.isoformat(),
-                "initial_shares": int(initial_shares),
-                "initial_cash": int(initial_cash),
-                "buy_band_pct": float(buy_band_pct),
-                "sell_band_pct": float(sell_band_pct),
-                "buy_steps": int(buy_steps),
-                "sell_steps": int(sell_steps),
-                "rebalance_months": int(rebalance_months),
-                "stock_ratio_pct": int(stock_ratio_pct),
-                "use_ma200": bool(use_ma200),
-                "fx_rate": int(fx_rate),
-                "sgov_rate_pct": float(sgov_rate_pct),
-                "threshold_asset": int(threshold_asset),
-                "monthly_deposit": int(monthly_deposit),
-                "monthly_withdrawal": int(monthly_withdrawal),
-                "extra_cash_amount": int(extra_cash_amount),
-                "extra_cash_step": int(extra_cash_step),
+            new_cfg = {
+                "sd": start_date.isoformat(),
+                "sh": int(initial_shares),
+                "ca": int(initial_cash),
+                "bb": float(buy_band_pct),
+                "sb": float(sell_band_pct),
+                "bs": int(buy_steps),
+                "ss": int(sell_steps),
+                "rm": int(rebalance_months),
+                "sr": int(stock_ratio_pct),
+                "ma": bool(use_ma200),
+                "fx": int(fx_rate),
+                "sg": float(sgov_rate_pct),
+                "th": int(threshold_asset),
+                "md": int(monthly_deposit),
+                "mw": int(monthly_withdrawal),
+                "ea": int(extra_cash_amount),
+                "es": int(extra_cash_step),
             }
-            st.session_state.pending_write = True
+            diff_cfg = {k: v for k, v in new_cfg.items() if v != DEFAULT_CFG[k]}
+            save_json_param("cfg", diff_cfg)
             st.rerun()
 
     st.divider()
-    st.subheader("💾 기기 이동용 백업 파일 (선택 사항)")
-    st.caption("PC와 스마트폰 간 데이터를 옮길 때만 파일로 저장/불러오기 하시면 됩니다.")
+    st.subheader("🔗 공유 및 백업")
+    st.caption("지인에게 공유할 때는 아래 기본 주소를 복사해 전달하세요 (내 잔고는 포함되지 않습니다).")
+    st.code("https://snowballtradingshare.streamlit.app/", language=None)
 
     export_payload = json.dumps(
         {
-            "cfg": st.session_state.saved_cfg,
+            "cfg": saved_cfg,
             "overrides": st.session_state.manual_overrides,
         },
         ensure_ascii=False,
@@ -574,22 +505,20 @@ with tab_cfg:
         try:
             loaded_data = json.load(uploaded_file)
             if "cfg" in loaded_data:
-                merged = DEFAULT_CFG.copy()
-                merged.update(loaded_data["cfg"])
-                st.session_state.saved_cfg = merged
+                diff_cfg = {k: v for k, v in loaded_data["cfg"].items() if k in DEFAULT_CFG and v != DEFAULT_CFG[k]}
+                save_json_param("cfg", diff_cfg)
             if "overrides" in loaded_data:
                 st.session_state.manual_overrides = loaded_data["overrides"]
-            st.session_state.pending_write = True
+                save_json_param("ov", st.session_state.manual_overrides)
             st.session_state.uploader_key += 1
-            st.success("백업 파일을 불러와 브라우저에 저장했습니다!")
             st.rerun()
         except Exception as e:
             st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
 
     if st.button("🔄 모든 설정 및 기록 초기화", use_container_width=True):
-        st.session_state.saved_cfg = DEFAULT_CFG.copy()
         st.session_state.manual_overrides = {}
-        st.session_state.pending_write = True
+        save_json_param("cfg", {})
+        save_json_param("ov", {})
         st.rerun()
 
 res = run_upro_simulation(
@@ -659,7 +588,7 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 매수·매도 분할 단계가 자동 보정되고 브라우저에 저장됩니다.")
+    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 매수·매도 분할 단계가 자동 보정되며 새로고침해도 유지됩니다.")
 
     with st.form("manual_trade_form"):
         m_date = st.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
@@ -672,13 +601,13 @@ with tab_order:
                 "shares": m_shares,
                 "cash": m_cash,
             }
-            st.session_state.pending_write = True
+            save_json_param("ov", st.session_state.manual_overrides)
             st.rerun()
 
     if st.session_state.manual_overrides:
         if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
             st.session_state.manual_overrides = {}
-            st.session_state.pending_write = True
+            save_json_param("ov", {})
             st.rerun()
 
 with tab_stats:
@@ -695,17 +624,3 @@ with tab_stats:
         use_container_width=True,
         hide_index=True,
     )
-
-# 저장 버튼 클릭 시에만 write, 그 외에는 read 실행
-latest_payload = json.dumps(
-    {
-        "cfg": st.session_state.saved_cfg,
-        "overrides": st.session_state.manual_overrides,
-    },
-    ensure_ascii=False,
-)
-if st.session_state.pending_write:
-    sync_browser_storage(latest_payload, mode="write")
-    st.session_state.pending_write = False
-else:
-    sync_browser_storage(latest_payload, mode="read")
