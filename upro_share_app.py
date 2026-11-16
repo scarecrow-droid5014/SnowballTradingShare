@@ -28,47 +28,53 @@ st.markdown(
 )
 
 
-# --- 브라우저 localStorage 자동 저장/복원 브릿지 ---
-def sync_browser_storage(payload_json: str, force_write: bool = False):
+# --- iframe 자체 localStorage 자동 저장/복원 브릿지 (크로스 오리진 차단 회피) ---
+def sync_browser_storage(payload_json: str, mode: str = "read"):
+    """
+    mode == "write": 현재 설정과 잔고 기록을 브라우저 localStorage에 기록
+    mode == "read":  앱 최초 로딩 시 localStorage에 저장된 값을 읽어 브릿지 입력창으로 전달
+    """
     safe_payload = json.dumps(payload_json)
-    write_flag = "true" if force_write else "false"
     components.html(
         f"""
         <script>
         (function() {{
-            const STORAGE_KEY = "upro_snowball_user_state_v1";
+            const STORAGE_KEY = "upro_snowball_user_state_v2";
+            const mode = "{mode}";
             const incomingData = {safe_payload};
-            const forceWrite = {write_flag};
 
             try {{
-                const parentWin = window.parent;
-                const storage = parentWin.localStorage;
+                // iframe 자체 origin의 localStorage 사용 (SecurityError 방지)
+                const storage = window.localStorage;
 
-                // 브릿지 입력창 부모 컨테이너 완전 숨김 처리
-                const bridgeInputs = parentWin.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
-                if (bridgeInputs.length > 0) {{
-                    const container = bridgeInputs[0].closest('div[data-testid="stTextInput"]');
-                    if (container) {{
-                        container.style.display = "none";
+                // 부모 문서의 브릿지 입력창 숨김 처리
+                try {{
+                    const bridgeInputs = window.parent.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
+                    if (bridgeInputs.length > 0) {{
+                        const container = bridgeInputs[0].closest('div[data-testid="stTextInput"]');
+                        if (container) container.style.display = "none";
                     }}
-                }}
+                }} catch (ignore) {{}}
 
-                if (forceWrite) {{
+                if (mode === "write") {{
                     storage.setItem(STORAGE_KEY, incomingData);
-                }} else {{
+                }} else if (mode === "read") {{
                     const saved = storage.getItem(STORAGE_KEY);
-                    if (saved && saved !== incomingData && bridgeInputs.length > 0) {{
-                        const inp = bridgeInputs[0];
-                        const nativeSetter = Object.getOwnPropertyDescriptor(parentWin.HTMLInputElement.prototype, "value").set;
-                        nativeSetter.call(inp, saved);
-                        inp.dispatchEvent(new Event("input", {{ bubbles: true }}));
-                        inp.dispatchEvent(new Event("change", {{ bubbles: true }}));
-                    }} else if (!saved && incomingData) {{
-                        storage.setItem(STORAGE_KEY, incomingData);
+                    if (saved) {{
+                        const bridgeInputs = window.parent.document.querySelectorAll('input[aria-label="__storage_bridge__"]');
+                        if (bridgeInputs.length > 0) {{
+                            const inp = bridgeInputs[0];
+                            if (inp.value !== saved) {{
+                                const nativeSetter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, "value").set;
+                                nativeSetter.call(inp, saved);
+                                inp.dispatchEvent(new Event("input", {{ bubbles: true }}));
+                                inp.dispatchEvent(new Event("change", {{ bubbles: true }}));
+                            }}
+                        }}
                     }}
                 }}
             }} catch (e) {{
-                console.warn("localStorage sync skipped:", e);
+                console.warn("Storage sync error:", e);
             }}
         }})();
         </script>
@@ -200,10 +206,8 @@ def run_upro_simulation(
             cur_week_high = max(cur_week_high, high)
             cur_week_low = min(cur_week_low, low)
 
-        # 1. 예수금 일할 이자
         cash += cash * daily_interest
 
-        # 2. 월별 적립금 / 생활비 인출 조건 체크 (시트 원본 동일 로직)
         day_actions = []
         if dt.month != prev_month:
             current_total_asset = cash + (shares * close * fx_rate)
@@ -228,7 +232,6 @@ def run_upro_simulation(
 
         trade_note = ""
 
-        # 3. 수동 실전 잔고 반영 + 매수/매도 분할 단계 자동 보정
         if date_str in manual_overrides:
             ov = manual_overrides[date_str]
             new_shares = int(ov["shares"])
@@ -264,7 +267,6 @@ def run_upro_simulation(
                     if prev_row["Close"] <= prev_row["MA200"] and close > ma200:
                         is_cross_ma200 = True
 
-            # 4. 정기 리밸런싱
             if rebalance_months > 0 and (shares > 0 or cash > 0):
                 months_passed = (dt.year - last_reb_year) * 12 + (dt.month - last_reb_month)
                 if months_passed >= rebalance_months:
@@ -279,7 +281,6 @@ def run_upro_simulation(
                     last_traded_week = week_num
                     trade_note = f"⚖️ 정기 리밸런싱({int(stock_ratio_pct)}:{int(100 - stock_ratio_pct)})"
 
-            # 5. 주간 1회 분할 매수(위기 추가 투입 포함) / 200일선 돌파 / 분할 매도
             if trade_note == "" and week_num != last_traded_week:
                 is_grid_buy = low <= target_buy
                 can_extra_inject = extra_cash_step > 0 and buy_step == extra_cash_step and extra_cash_amount > 0
@@ -433,12 +434,11 @@ if "saved_cfg" not in st.session_state:
     st.session_state.saved_cfg = DEFAULT_CFG.copy()
 if "storage_loaded" not in st.session_state:
     st.session_state.storage_loaded = False
-if "force_storage_write" not in st.session_state:
-    st.session_state.force_storage_write = False
+if "pending_write" not in st.session_state:
+    st.session_state.pending_write = False
 if "uploader_key" not in st.session_state:
     st.session_state.uploader_key = 0
 
-# 브라우저 localStorage 수신용 입력 위젯 (화면 밖 완전 숨김)
 st.markdown(
     """
     <style>
@@ -470,7 +470,7 @@ tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 �
 
 with tab_cfg:
     st.subheader("내 계좌 및 전략 파라미터")
-    st.caption("모든 설정과 매매 기록은 현재 기기의 브라우저에 자동 저장되며, 앱 실행 시 자동으로 불러옵니다.")
+    st.caption("파라미터를 변경한 뒤 아래 [💾 투자 설정 저장하기] 버튼을 누르면 브라우저에 영구 저장됩니다.")
 
     cfg = st.session_state.saved_cfg
     try:
@@ -479,69 +479,70 @@ with tab_cfg:
     except Exception:
         default_start = max_db_date
 
-    start_date = st.date_input(
-        "투자 시작일",
-        value=default_start,
-        min_value=min_db_date,
-        max_value=max_db_date,
-    )
+    with st.form("strategy_cfg_form"):
+        start_date = st.date_input(
+            "투자 시작일",
+            value=default_start,
+            min_value=min_db_date,
+            max_value=max_db_date,
+        )
 
-    c1, c2 = st.columns(2)
-    initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(cfg["initial_shares"]), step=1)
-    initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(cfg["initial_cash"]), step=500000)
+        c1, c2 = st.columns(2)
+        initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(cfg["initial_shares"]), step=1)
+        initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(cfg["initial_cash"]), step=500000)
 
-    c3, c4 = st.columns(2)
-    buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(cfg["buy_band_pct"]), step=1.0)
-    sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=float(cfg["sell_band_pct"]), step=1.0)
+        c3, c4 = st.columns(2)
+        buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(cfg["buy_band_pct"]), step=1.0)
+        sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=float(cfg["sell_band_pct"]), step=1.0)
 
-    c5, c6 = st.columns(2)
-    buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=int(cfg["buy_steps"]), step=1)
-    sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=int(cfg["sell_steps"]), step=1)
+        c5, c6 = st.columns(2)
+        buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=int(cfg["buy_steps"]), step=1)
+        sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=int(cfg["sell_steps"]), step=1)
 
-    c7, c8 = st.columns(2)
-    rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=int(cfg["rebalance_months"]), step=1)
-    stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=int(cfg["stock_ratio_pct"]), step=5)
+        c7, c8 = st.columns(2)
+        rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=int(cfg["rebalance_months"]), step=1)
+        stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=int(cfg["stock_ratio_pct"]), step=5)
 
-    c9, c10 = st.columns(2)
-    ma200_idx = 0 if cfg["use_ma200"] else 1
-    use_ma200 = c9.selectbox("200일선 상향 돌파 매수", options=[True, False], index=ma200_idx, format_func=lambda x: "사용함" if x else "미사용")
-    fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=int(cfg["fx_rate"]), step=10)
+        c9, c10 = st.columns(2)
+        ma200_idx = 0 if cfg["use_ma200"] else 1
+        use_ma200 = c9.selectbox("200일선 상향 돌파 매수", options=[True, False], index=ma200_idx, format_func=lambda x: "사용함" if x else "미사용")
+        fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=int(cfg["fx_rate"]), step=10)
 
-    c11, c12 = st.columns(2)
-    sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(cfg["sgov_rate_pct"]), step=0.1)
-    threshold_asset = c12.number_input("적립/인출 기준 자산 (원)", min_value=0, value=int(cfg["threshold_asset"]), step=10000000)
+        c11, c12 = st.columns(2)
+        sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(cfg["sgov_rate_pct"]), step=0.1)
+        threshold_asset = c12.number_input("적립/인출 기준 자산 (원)", min_value=0, value=int(cfg["threshold_asset"]), step=10000000)
 
-    c13, c14 = st.columns(2)
-    monthly_deposit = c13.number_input("월별 적립금 (기준 미만 시)", min_value=0, value=int(cfg["monthly_deposit"]), step=100000)
-    monthly_withdrawal = c14.number_input("월별 인출금 (기준 이상 시)", min_value=0, value=int(cfg["monthly_withdrawal"]), step=100000)
+        c13, c14 = st.columns(2)
+        monthly_deposit = c13.number_input("월별 적립금 (기준 미만 시)", min_value=0, value=int(cfg["monthly_deposit"]), step=100000)
+        monthly_withdrawal = c14.number_input("월별 인출금 (기준 이상 시)", min_value=0, value=int(cfg["monthly_withdrawal"]), step=100000)
 
-    c15, c16 = st.columns(2)
-    extra_cash_step = c15.number_input("위기 추가투입 단계 (0=미사용)", min_value=0, max_value=20, value=int(cfg["extra_cash_step"]), step=1)
-    extra_cash_amount = c16.number_input("위기 추가투입금 (원)", min_value=0, value=int(cfg["extra_cash_amount"]), step=500000)
+        c15, c16 = st.columns(2)
+        extra_cash_step = c15.number_input("위기 추가투입 단계 (0=미사용)", min_value=0, max_value=20, value=int(cfg["extra_cash_step"]), step=1)
+        extra_cash_amount = c16.number_input("위기 추가투입금 (원)", min_value=0, value=int(cfg["extra_cash_amount"]), step=500000)
 
-    current_cfg = {
-        "start_date": start_date.isoformat(),
-        "initial_shares": int(initial_shares),
-        "initial_cash": int(initial_cash),
-        "buy_band_pct": float(buy_band_pct),
-        "sell_band_pct": float(sell_band_pct),
-        "buy_steps": int(buy_steps),
-        "sell_steps": int(sell_steps),
-        "rebalance_months": int(rebalance_months),
-        "stock_ratio_pct": int(stock_ratio_pct),
-        "use_ma200": bool(use_ma200),
-        "fx_rate": int(fx_rate),
-        "sgov_rate_pct": float(sgov_rate_pct),
-        "threshold_asset": int(threshold_asset),
-        "monthly_deposit": int(monthly_deposit),
-        "monthly_withdrawal": int(monthly_withdrawal),
-        "extra_cash_amount": int(extra_cash_amount),
-        "extra_cash_step": int(extra_cash_step),
-    }
-
-    if current_cfg != st.session_state.saved_cfg:
-        st.session_state.saved_cfg = current_cfg
-        st.session_state.force_storage_write = True
+        save_cfg_btn = st.form_submit_button("💾 투자 설정 저장하기", use_container_width=True)
+        if save_cfg_btn:
+            st.session_state.saved_cfg = {
+                "start_date": start_date.isoformat(),
+                "initial_shares": int(initial_shares),
+                "initial_cash": int(initial_cash),
+                "buy_band_pct": float(buy_band_pct),
+                "sell_band_pct": float(sell_band_pct),
+                "buy_steps": int(buy_steps),
+                "sell_steps": int(sell_steps),
+                "rebalance_months": int(rebalance_months),
+                "stock_ratio_pct": int(stock_ratio_pct),
+                "use_ma200": bool(use_ma200),
+                "fx_rate": int(fx_rate),
+                "sgov_rate_pct": float(sgov_rate_pct),
+                "threshold_asset": int(threshold_asset),
+                "monthly_deposit": int(monthly_deposit),
+                "monthly_withdrawal": int(monthly_withdrawal),
+                "extra_cash_amount": int(extra_cash_amount),
+                "extra_cash_step": int(extra_cash_step),
+            }
+            st.session_state.pending_write = True
+            st.rerun()
 
     st.divider()
     st.subheader("💾 기기 이동용 백업 파일 (선택 사항)")
@@ -549,7 +550,7 @@ with tab_cfg:
 
     export_payload = json.dumps(
         {
-            "cfg": current_cfg,
+            "cfg": st.session_state.saved_cfg,
             "overrides": st.session_state.manual_overrides,
         },
         ensure_ascii=False,
@@ -578,9 +579,9 @@ with tab_cfg:
                 st.session_state.saved_cfg = merged
             if "overrides" in loaded_data:
                 st.session_state.manual_overrides = loaded_data["overrides"]
-            st.session_state.force_storage_write = True
+            st.session_state.pending_write = True
             st.session_state.uploader_key += 1
-            st.success("백업 파일을 불러와 브라우저에 자동 저장했습니다!")
+            st.success("백업 파일을 불러와 브라우저에 저장했습니다!")
             st.rerun()
         except Exception as e:
             st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
@@ -588,7 +589,7 @@ with tab_cfg:
     if st.button("🔄 모든 설정 및 기록 초기화", use_container_width=True):
         st.session_state.saved_cfg = DEFAULT_CFG.copy()
         st.session_state.manual_overrides = {}
-        st.session_state.force_storage_write = True
+        st.session_state.pending_write = True
         st.rerun()
 
 res = run_upro_simulation(
@@ -671,13 +672,13 @@ with tab_order:
                 "shares": m_shares,
                 "cash": m_cash,
             }
-            st.session_state.force_storage_write = True
+            st.session_state.pending_write = True
             st.rerun()
 
     if st.session_state.manual_overrides:
         if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
             st.session_state.manual_overrides = {}
-            st.session_state.force_storage_write = True
+            st.session_state.pending_write = True
             st.rerun()
 
 with tab_stats:
@@ -695,6 +696,7 @@ with tab_stats:
         hide_index=True,
     )
 
+# 저장 버튼 클릭 시에만 write, 그 외에는 read 실행
 latest_payload = json.dumps(
     {
         "cfg": st.session_state.saved_cfg,
@@ -702,5 +704,8 @@ latest_payload = json.dumps(
     },
     ensure_ascii=False,
 )
-sync_browser_storage(latest_payload, force_write=st.session_state.force_storage_write)
-st.session_state.force_storage_write = False
+if st.session_state.pending_write:
+    sync_browser_storage(latest_payload, mode="write")
+    st.session_state.pending_write = False
+else:
+    sync_browser_storage(latest_payload, mode="read")
