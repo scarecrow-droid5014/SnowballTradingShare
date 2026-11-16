@@ -48,6 +48,12 @@ def hash_pin(pin: str) -> str:
     return hashlib.sha256(pin.strip().encode("utf-8")).hexdigest()
 
 
+def make_auto_token(username: str, pin_hash: str) -> str:
+    """닉네임과 PIN 해시로 고정 자동로그인 인증키(16자리) 생성"""
+    raw = f"{username}:{pin_hash}:snowball_auto_v1".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
 def load_user_from_github(username: str):
     token, repo = get_github_config()
     if not token:
@@ -85,7 +91,6 @@ def save_user_to_github(username: str, pin_hash: str, cfg: dict, overrides: dict
         "Accept": "application/vnd.github.v3+json",
     }
 
-    # 최신 sha 확보 (충돌 방지)
     if not sha:
         check_res = requests.get(url, headers=headers, timeout=10)
         if check_res.status_code == 200:
@@ -429,10 +434,6 @@ def run_upro_simulation(
 # --- UI 렌더링 ---
 st.title("❄️ UPRO 스노우볼 매매 앱")
 
-# 주소창에 남아 있을 수 있는 기존 쿼리 파라미터 제거 (항상 고정 URL 유지)
-if st.query_params:
-    st.query_params.clear()
-
 try:
     raw_df = load_upro_data()
 except Exception as e:
@@ -475,14 +476,33 @@ if "saved_cfg" not in st.session_state:
 if "manual_overrides" not in st.session_state:
     st.session_state.manual_overrides = {}
 
+# --- 자동 로그인 처리 (?u=닉네임&k=인증키) ---
+qp_user = st.query_params.get("u", "")
+qp_key = st.query_params.get("k", "")
+if not st.session_state.logged_user and qp_user and qp_key:
+    safe_u = sanitize_username(qp_user)
+    if safe_u:
+        existing_data, sha, err = load_user_from_github(safe_u)
+        if existing_data and not err:
+            stored_hash = existing_data.get("pin_hash", "")
+            if make_auto_token(safe_u, stored_hash) == qp_key:
+                merged = DEFAULT_CFG.copy()
+                merged.update(existing_data.get("cfg", {}))
+                st.session_state.logged_user = safe_u
+                st.session_state.pin_hash = stored_hash
+                st.session_state.file_sha = sha
+                st.session_state.saved_cfg = merged
+                st.session_state.manual_overrides = existing_data.get("overrides", {})
+
 # --- 상단 내 계좌 불러오기 / 로그인 바 ---
 if not st.session_state.logged_user:
     with st.expander("🔑 내 계좌 설정·기록 불러오기 (또는 새 사용자 등록)", expanded=True):
-        st.caption("닉네임과 비밀번호(PIN)를 입력하면 클라우드에 내 설정과 매매 기록이 영구 저장됩니다. (지인과 데이터가 섞이지 않습니다)")
+        st.caption("닉네임과 비밀번호(PIN)를 입력하면 클라우드에 내 설정과 매매 기록이 영구 저장됩니다.")
         with st.form("user_login_form"):
             lc1, lc2 = st.columns(2)
             in_user = lc1.text_input("닉네임 (영문/한글/숫자)", placeholder="예: lucas")
             in_pin = lc2.text_input("비밀번호 (PIN)", type="password", placeholder="4자리 이상")
+            remember_me = st.checkbox("📱 이 기기에서 자동 로그인 유지 (홈 화면 추가/북마크용)", value=True)
             login_btn = st.form_submit_button("📂 불러오기 / 새 계좌 시작", use_container_width=True)
 
             if login_btn:
@@ -505,9 +525,11 @@ if not st.session_state.logged_user:
                             st.session_state.file_sha = sha
                             st.session_state.saved_cfg = merged
                             st.session_state.manual_overrides = existing_data.get("overrides", {})
+                            if remember_me:
+                                st.query_params["u"] = safe_u
+                                st.query_params["k"] = make_auto_token(safe_u, p_hash)
                             st.rerun()
                     else:
-                        # 신규 사용자 파일 생성
                         new_sha, save_err = save_user_to_github(safe_u, p_hash, DEFAULT_CFG.copy(), {}, None)
                         if save_err:
                             st.error(save_err)
@@ -517,6 +539,9 @@ if not st.session_state.logged_user:
                             st.session_state.file_sha = new_sha
                             st.session_state.saved_cfg = DEFAULT_CFG.copy()
                             st.session_state.manual_overrides = {}
+                            if remember_me:
+                                st.query_params["u"] = safe_u
+                                st.query_params["k"] = make_auto_token(safe_u, p_hash)
                             st.rerun()
 else:
     uc1, uc2 = st.columns([3, 1])
@@ -530,6 +555,7 @@ else:
         st.session_state.file_sha = None
         st.session_state.saved_cfg = DEFAULT_CFG.copy()
         st.session_state.manual_overrides = {}
+        st.query_params.clear()
         st.rerun()
 
 saved_cfg = st.session_state.saved_cfg
@@ -628,6 +654,11 @@ with tab_cfg:
                     st.rerun()
             else:
                 st.rerun()
+
+    st.divider()
+    st.subheader("🔗 앱 공유 링크")
+    st.caption("지인에게 공유할 때는 아래 기본 주소를 복사해 보내세요 (내 계정 정보는 포함되지 않습니다).")
+    st.code("https://snowballtradingshare.streamlit.app", language=None)
 
     if st.button("🔄 모든 설정 및 기록 초기화", use_container_width=True):
         st.session_state.saved_cfg = DEFAULT_CFG.copy()
