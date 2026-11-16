@@ -1,7 +1,11 @@
+import base64
 import datetime
+import hashlib
 import json
+import re
 import numpy as np
 import pandas as pd
+import requests
 import streamlit as st
 import yfinance as yf
 
@@ -21,28 +25,96 @@ st.markdown(
     .buy-box { background-color: #e8f5e9; border-radius: 10px; padding: 14px; color: #1b5e20; }
     .sell-box { background-color: #ffebee; border-radius: 10px; padding: 14px; color: #b71c1c; }
     .guide-banner { background-color: #fff3cd; color: #856404; padding: 10px 14px; border-radius: 8px; font-weight: 600; font-size: 0.9rem; margin-bottom: 14px; }
+    .user-badge { background-color: #eef2ff; color: #3730a3; padding: 8px 12px; border-radius: 8px; font-size: 0.85rem; font-weight: 600; margin-bottom: 10px; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 
-# --- Streamlit 공식 query_params 기반 영구 저장/복원 ---
-def load_json_param(key: str) -> dict:
-    raw = st.query_params.get(key, "")
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
+# --- GitHub API 영구 저장소 연동 ---
+def get_github_config():
+    token = st.secrets.get("GITHUB_TOKEN", "")
+    repo = st.secrets.get("GITHUB_REPO", "scarecrow-droid5014/SnowballTradingShare")
+    return token, repo
 
 
-def save_json_param(key: str, data: dict):
-    if data:
-        st.query_params[key] = json.dumps(data, separators=(",", ":"))
-    elif key in st.query_params:
-        del st.query_params[key]
+def sanitize_username(username: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9가-힣_-]", "", username.strip().lower())
+    return cleaned[:30]
+
+
+def hash_pin(pin: str) -> str:
+    return hashlib.sha256(pin.strip().encode("utf-8")).hexdigest()
+
+
+def load_user_from_github(username: str):
+    token, repo = get_github_config()
+    if not token:
+        return None, None, "Streamlit Secrets에 GITHUB_TOKEN이 설정되지 않았습니다."
+
+    safe_user = sanitize_username(username)
+    if not safe_user:
+        return None, None, "올바른 닉네임을 입력해 주세요."
+
+    url = f"https://api.github.com/repos/{repo}/contents/user_data/{safe_user}.json"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+    res = requests.get(url, headers=headers, timeout=10)
+    if res.status_code == 200:
+        body = res.json()
+        raw_content = base64.b64decode(body["content"]).decode("utf-8")
+        return json.loads(raw_content), body["sha"], None
+    elif res.status_code == 404:
+        return None, None, None
+    else:
+        return None, None, f"GitHub 조회 오류 ({res.status_code}): {res.text}"
+
+
+def save_user_to_github(username: str, pin_hash: str, cfg: dict, overrides: dict, sha: str = None):
+    token, repo = get_github_config()
+    if not token:
+        return None, "Streamlit Secrets에 GITHUB_TOKEN이 설정되지 않았습니다."
+
+    safe_user = sanitize_username(username)
+    url = f"https://api.github.com/repos/{repo}/contents/user_data/{safe_user}.json"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # 최신 sha 확보 (충돌 방지)
+    if not sha:
+        check_res = requests.get(url, headers=headers, timeout=10)
+        if check_res.status_code == 200:
+            sha = check_res.json().get("sha")
+
+    payload_obj = {
+        "username": safe_user,
+        "pin_hash": pin_hash,
+        "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "cfg": cfg,
+        "overrides": overrides,
+    }
+    encoded_content = base64.b64encode(
+        json.dumps(payload_obj, ensure_ascii=False, indent=2).encode("utf-8")
+    ).decode("utf-8")
+
+    body = {
+        "message": f"Update user data: {safe_user}",
+        "content": encoded_content,
+    }
+    if sha:
+        body["sha"] = sha
+
+    put_res = requests.put(url, headers=headers, json=body, timeout=10)
+    if put_res.status_code in (200, 201):
+        new_sha = put_res.json().get("content", {}).get("sha")
+        return new_sha, None
+    else:
+        return sha, f"GitHub 저장 실패 ({put_res.status_code}): {put_res.text}"
 
 
 @st.cache_data(ttl=3600)
@@ -357,6 +429,10 @@ def run_upro_simulation(
 # --- UI 렌더링 ---
 st.title("❄️ UPRO 스노우볼 매매 앱")
 
+# 주소창에 남아 있을 수 있는 기존 쿼리 파라미터 제거 (항상 고정 URL 유지)
+if st.query_params:
+    st.query_params.clear()
+
 try:
     raw_df = load_upro_data()
 except Exception as e:
@@ -388,19 +464,84 @@ DEFAULT_CFG = {
     "es": 0,
 }
 
+if "logged_user" not in st.session_state:
+    st.session_state.logged_user = ""
+if "pin_hash" not in st.session_state:
+    st.session_state.pin_hash = ""
+if "file_sha" not in st.session_state:
+    st.session_state.file_sha = None
+if "saved_cfg" not in st.session_state:
+    st.session_state.saved_cfg = DEFAULT_CFG.copy()
 if "manual_overrides" not in st.session_state:
-    st.session_state.manual_overrides = load_json_param("ov")
-if "uploader_key" not in st.session_state:
-    st.session_state.uploader_key = 0
+    st.session_state.manual_overrides = {}
 
-saved_cfg = DEFAULT_CFG.copy()
-saved_cfg.update(load_json_param("cfg"))
+# --- 상단 내 계좌 불러오기 / 로그인 바 ---
+if not st.session_state.logged_user:
+    with st.expander("🔑 내 계좌 설정·기록 불러오기 (또는 새 사용자 등록)", expanded=True):
+        st.caption("닉네임과 비밀번호(PIN)를 입력하면 클라우드에 내 설정과 매매 기록이 영구 저장됩니다. (지인과 데이터가 섞이지 않습니다)")
+        with st.form("user_login_form"):
+            lc1, lc2 = st.columns(2)
+            in_user = lc1.text_input("닉네임 (영문/한글/숫자)", placeholder="예: lucas")
+            in_pin = lc2.text_input("비밀번호 (PIN)", type="password", placeholder="4자리 이상")
+            login_btn = st.form_submit_button("📂 불러오기 / 새 계좌 시작", use_container_width=True)
+
+            if login_btn:
+                safe_u = sanitize_username(in_user)
+                if not safe_u or len(in_pin.strip()) < 4:
+                    st.warning("닉네임과 4자리 이상의 비밀번호(PIN)를 입력해 주세요.")
+                else:
+                    p_hash = hash_pin(in_pin)
+                    existing_data, sha, err = load_user_from_github(safe_u)
+                    if err:
+                        st.error(err)
+                    elif existing_data is not None:
+                        if existing_data.get("pin_hash") != p_hash:
+                            st.error("비밀번호(PIN)가 일치하지 않습니다.")
+                        else:
+                            merged = DEFAULT_CFG.copy()
+                            merged.update(existing_data.get("cfg", {}))
+                            st.session_state.logged_user = safe_u
+                            st.session_state.pin_hash = p_hash
+                            st.session_state.file_sha = sha
+                            st.session_state.saved_cfg = merged
+                            st.session_state.manual_overrides = existing_data.get("overrides", {})
+                            st.rerun()
+                    else:
+                        # 신규 사용자 파일 생성
+                        new_sha, save_err = save_user_to_github(safe_u, p_hash, DEFAULT_CFG.copy(), {}, None)
+                        if save_err:
+                            st.error(save_err)
+                        else:
+                            st.session_state.logged_user = safe_u
+                            st.session_state.pin_hash = p_hash
+                            st.session_state.file_sha = new_sha
+                            st.session_state.saved_cfg = DEFAULT_CFG.copy()
+                            st.session_state.manual_overrides = {}
+                            st.rerun()
+else:
+    uc1, uc2 = st.columns([3, 1])
+    uc1.markdown(
+        f'<div class="user-badge">👤 접속 계정: <b>{st.session_state.logged_user}</b> (클라우드 자동 동기화 중)</div>',
+        unsafe_allow_html=True,
+    )
+    if uc2.button("로그아웃", use_container_width=True):
+        st.session_state.logged_user = ""
+        st.session_state.pin_hash = ""
+        st.session_state.file_sha = None
+        st.session_state.saved_cfg = DEFAULT_CFG.copy()
+        st.session_state.manual_overrides = {}
+        st.rerun()
+
+saved_cfg = st.session_state.saved_cfg
 
 tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 투자 설정", "📊 성과 및 기록"])
 
 with tab_cfg:
     st.subheader("내 계좌 및 전략 파라미터")
-    st.caption("파라미터를 변경한 뒤 [💾 투자 설정 저장하기]를 누르면 새로고침해도 계속 유지됩니다.")
+    if st.session_state.logged_user:
+        st.caption(f"**{st.session_state.logged_user}** 계정의 설정과 잔고는 저장 시 GitHub 클라우드에 영구 기록됩니다.")
+    else:
+        st.warning("상단에서 닉네임과 PIN으로 로그인하면 설정과 매매 기록이 영구 저장됩니다.")
 
     try:
         parsed_sd = datetime.date.fromisoformat(saved_cfg["sd"])
@@ -470,55 +611,36 @@ with tab_cfg:
                 "ea": int(extra_cash_amount),
                 "es": int(extra_cash_step),
             }
-            diff_cfg = {k: v for k, v in new_cfg.items() if v != DEFAULT_CFG[k]}
-            save_json_param("cfg", diff_cfg)
-            st.rerun()
-
-    st.divider()
-    st.subheader("🔗 공유 및 백업")
-    st.caption("지인에게 공유할 때는 아래 기본 주소를 복사해 전달하세요 (내 잔고는 포함되지 않습니다).")
-    st.code("https://snowballtradingshare.streamlit.app/", language=None)
-
-    export_payload = json.dumps(
-        {
-            "cfg": saved_cfg,
-            "overrides": st.session_state.manual_overrides,
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
-
-    st.download_button(
-        label="📥 백업 파일 내보내기 (.json)",
-        data=export_payload,
-        file_name=f"upro_snowball_{latest_db_date}.json",
-        mime="application/json",
-        use_container_width=True,
-    )
-
-    uploaded_file = st.file_uploader(
-        "백업 파일 불러오기 (.json)",
-        type=["json"],
-        key=f"cfg_uploader_{st.session_state.uploader_key}",
-    )
-    if uploaded_file is not None:
-        try:
-            loaded_data = json.load(uploaded_file)
-            if "cfg" in loaded_data:
-                diff_cfg = {k: v for k, v in loaded_data["cfg"].items() if k in DEFAULT_CFG and v != DEFAULT_CFG[k]}
-                save_json_param("cfg", diff_cfg)
-            if "overrides" in loaded_data:
-                st.session_state.manual_overrides = loaded_data["overrides"]
-                save_json_param("ov", st.session_state.manual_overrides)
-            st.session_state.uploader_key += 1
-            st.rerun()
-        except Exception as e:
-            st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+            st.session_state.saved_cfg = new_cfg
+            if st.session_state.logged_user:
+                new_sha, err = save_user_to_github(
+                    st.session_state.logged_user,
+                    st.session_state.pin_hash,
+                    new_cfg,
+                    st.session_state.manual_overrides,
+                    st.session_state.file_sha,
+                )
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.file_sha = new_sha
+                    st.success("클라우드에 설정이 저장되었습니다!")
+                    st.rerun()
+            else:
+                st.rerun()
 
     if st.button("🔄 모든 설정 및 기록 초기화", use_container_width=True):
+        st.session_state.saved_cfg = DEFAULT_CFG.copy()
         st.session_state.manual_overrides = {}
-        save_json_param("cfg", {})
-        save_json_param("ov", {})
+        if st.session_state.logged_user:
+            new_sha, _ = save_user_to_github(
+                st.session_state.logged_user,
+                st.session_state.pin_hash,
+                DEFAULT_CFG.copy(),
+                {},
+                st.session_state.file_sha,
+            )
+            st.session_state.file_sha = new_sha
         st.rerun()
 
 res = run_upro_simulation(
@@ -588,7 +710,7 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 매수·매도 분할 단계가 자동 보정되며 새로고침해도 유지됩니다.")
+    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 분할 단계가 자동 보정되고 클라우드에 영구 저장됩니다.")
 
     with st.form("manual_trade_form"):
         m_date = st.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
@@ -601,13 +723,34 @@ with tab_order:
                 "shares": m_shares,
                 "cash": m_cash,
             }
-            save_json_param("ov", st.session_state.manual_overrides)
-            st.rerun()
+            if st.session_state.logged_user:
+                new_sha, err = save_user_to_github(
+                    st.session_state.logged_user,
+                    st.session_state.pin_hash,
+                    st.session_state.saved_cfg,
+                    st.session_state.manual_overrides,
+                    st.session_state.file_sha,
+                )
+                if err:
+                    st.error(err)
+                else:
+                    st.session_state.file_sha = new_sha
+                    st.rerun()
+            else:
+                st.rerun()
 
     if st.session_state.manual_overrides:
         if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
             st.session_state.manual_overrides = {}
-            save_json_param("ov", {})
+            if st.session_state.logged_user:
+                new_sha, _ = save_user_to_github(
+                    st.session_state.logged_user,
+                    st.session_state.pin_hash,
+                    st.session_state.saved_cfg,
+                    {},
+                    st.session_state.file_sha,
+                )
+                st.session_state.file_sha = new_sha
             st.rerun()
 
 with tab_stats:
