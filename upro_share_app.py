@@ -27,9 +27,9 @@ st.markdown(
 )
 
 
-# --- URL 쿼리 파라미터로 수동 입력 영구 보존 ---
-def load_overrides_from_url() -> dict:
-    raw = st.query_params.get("ov", "")
+# --- URL 쿼리 파라미터로 실전 잔고(ov) 및 투자 설정(cfg) 영구 보존 ---
+def load_json_param(key: str) -> dict:
+    raw = st.query_params.get(key, "")
     if not raw:
         return {}
     try:
@@ -38,11 +38,11 @@ def load_overrides_from_url() -> dict:
         return {}
 
 
-def save_overrides_to_url(overrides: dict):
-    if overrides:
-        st.query_params["ov"] = json.dumps(overrides, separators=(",", ":"))
-    elif "ov" in st.query_params:
-        del st.query_params["ov"]
+def save_json_param(key: str, data: dict):
+    if data:
+        st.query_params[key] = json.dumps(data, separators=(",", ":"))
+    elif key in st.query_params:
+        del st.query_params[key]
 
 
 @st.cache_data(ttl=3600)
@@ -316,7 +316,9 @@ def run_upro_simulation(
 st.title("❄️ UPRO 스노우볼 매매 앱")
 
 if "manual_overrides" not in st.session_state:
-    st.session_state.manual_overrides = load_overrides_from_url()
+    st.session_state.manual_overrides = load_json_param("ov")
+
+saved_cfg = load_json_param("cfg")
 
 try:
     raw_df = load_upro_data()
@@ -325,43 +327,94 @@ except Exception as e:
     st.stop()
 
 latest_db_date = raw_df.iloc[-1]["Date"].strftime("%Y-%m-%d")
+min_db_date = raw_df.iloc[0]["Date"].date()
+max_db_date = raw_df.iloc[-1]["Date"].date()
 st.caption(f"야후 파이낸스 UPRO 실시간 연동 · 기준일: {latest_db_date}")
 
 tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 투자 설정", "📊 성과 및 기록"])
 
 with tab_cfg:
     st.subheader("내 계좌 및 전략 파라미터")
-    default_start = raw_df.iloc[-1]["Date"].date()
+    st.caption("설정을 변경하면 URL에 자동 기록되어 새로고침해도 유지됩니다.")
+
+    default_start = max_db_date
+    if "sd" in saved_cfg:
+        try:
+            parsed_sd = datetime.date.fromisoformat(saved_cfg["sd"])
+            default_start = min(max(parsed_sd, min_db_date), max_db_date)
+        except Exception:
+            pass
+
     start_date = st.date_input(
         "투자 시작일",
         value=default_start,
-        min_value=raw_df.iloc[0]["Date"].date(),
-        max_value=raw_df.iloc[-1]["Date"].date(),
+        min_value=min_db_date,
+        max_value=max_db_date,
     )
 
     c1, c2 = st.columns(2)
-    initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=0, step=1)
-    initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=0, step=500000)
+    initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(saved_cfg.get("sh", 0)), step=1)
+    initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(saved_cfg.get("ca", 0)), step=500000)
 
     c3, c4 = st.columns(2)
-    buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=-5.0, step=1.0)
-    sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=5.0, step=1.0)
+    buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(saved_cfg.get("bb", -5.0)), step=1.0)
+    sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=float(saved_cfg.get("sb", 5.0)), step=1.0)
 
     c5, c6 = st.columns(2)
-    buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=5, step=1)
-    sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=4, step=1)
+    buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=int(saved_cfg.get("bs", 5)), step=1)
+    sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=int(saved_cfg.get("ss", 4)), step=1)
 
     c7, c8 = st.columns(2)
-    rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=12, step=1)
-    stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=50, step=5)
+    rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=int(saved_cfg.get("rm", 12)), step=1)
+    stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=int(saved_cfg.get("sr", 50)), step=5)
 
     c9, c10 = st.columns(2)
-    use_ma200 = c9.selectbox("200일선 상향 돌파 매수", options=[True, False], format_func=lambda x: "사용함" if x else "미사용")
-    fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=1350, step=10)
+    ma200_idx = 0 if saved_cfg.get("ma", True) else 1
+    use_ma200 = c9.selectbox("200일선 상향 돌파 매수", options=[True, False], index=ma200_idx, format_func=lambda x: "사용함" if x else "미사용")
+    fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=int(saved_cfg.get("fx", 1350)), step=10)
 
     c11, c12 = st.columns(2)
-    sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=4.5, step=0.1)
-    monthly_deposit = c12.number_input("월별 적립금 (원)", min_value=0, value=0, step=100000)
+    sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(saved_cfg.get("sg", 4.5)), step=0.1)
+    monthly_deposit = c12.number_input("월별 적립금 (원)", min_value=0, value=int(saved_cfg.get("md", 0)), step=100000)
+
+    # 기본값과 다른 항목만 압축해 URL(cfg)에 자동 저장
+    defaults = {
+        "sd": max_db_date.isoformat(),
+        "sh": 0,
+        "ca": 0,
+        "bb": -5.0,
+        "sb": 5.0,
+        "bs": 5,
+        "ss": 4,
+        "rm": 12,
+        "sr": 50,
+        "ma": True,
+        "fx": 1350,
+        "sg": 4.5,
+        "md": 0,
+    }
+    current_cfg = {
+        "sd": start_date.isoformat(),
+        "sh": int(initial_shares),
+        "ca": int(initial_cash),
+        "bb": float(buy_band_pct),
+        "sb": float(sell_band_pct),
+        "bs": int(buy_steps),
+        "ss": int(sell_steps),
+        "rm": int(rebalance_months),
+        "sr": int(stock_ratio_pct),
+        "ma": bool(use_ma200),
+        "fx": int(fx_rate),
+        "sg": float(sgov_rate_pct),
+        "md": int(monthly_deposit),
+    }
+    diff_cfg = {k: v for k, v in current_cfg.items() if v != defaults[k]}
+    save_json_param("cfg", diff_cfg)
+
+    if diff_cfg:
+        if st.button("🔄 투자 설정 기본값으로 초기화", use_container_width=True):
+            save_json_param("cfg", {})
+            st.rerun()
 
 res = run_upro_simulation(
     raw_df=raw_df,
@@ -439,13 +492,13 @@ with tab_order:
                 "shares": m_shares,
                 "cash": m_cash,
             }
-            save_overrides_to_url(st.session_state.manual_overrides)
+            save_json_param("ov", st.session_state.manual_overrides)
             st.rerun()
 
     if st.session_state.manual_overrides:
         if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
             st.session_state.manual_overrides = {}
-            save_overrides_to_url({})
+            save_json_param("ov", {})
             st.rerun()
 
 with tab_stats:
