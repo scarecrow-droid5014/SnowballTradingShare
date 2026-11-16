@@ -27,24 +27,6 @@ st.markdown(
 )
 
 
-# --- URL 쿼리 파라미터로 실전 잔고(ov) 및 투자 설정(cfg) 영구 보존 ---
-def load_json_param(key: str) -> dict:
-    raw = st.query_params.get(key, "")
-    if not raw:
-        return {}
-    try:
-        return json.loads(raw)
-    except Exception:
-        return {}
-
-
-def save_json_param(key: str, data: dict):
-    if data:
-        st.query_params[key] = json.dumps(data, separators=(",", ":"))
-    elif key in st.query_params:
-        del st.query_params[key]
-
-
 @st.cache_data(ttl=3600)
 def load_upro_data() -> pd.DataFrame:
     df = yf.download("UPRO", period="5y", interval="1d", progress=False, auto_adjust=False)
@@ -269,7 +251,6 @@ def run_upro_simulation(
     this_week = get_week_key(now_ny)
     is_weekend_or_new_week = (this_week != cur_week) or (now_ny.weekday() >= 5)
 
-    # 루프 내 부분 집계가 아닌 전체 주간 집계(weekly_stats)에서 정확한 고·저가 조회
     cur_week_full = weekly_stats.get(cur_week, {"High": cur_week_high, "Low": cur_week_low})
     prev_week_full = {"High": exact_prev_high, "Low": exact_prev_low}
     if cur_week in all_weeks:
@@ -315,10 +296,9 @@ def run_upro_simulation(
 # --- UI 렌더링 ---
 st.title("❄️ UPRO 스노우볼 매매 앱")
 
-if "manual_overrides" not in st.session_state:
-    st.session_state.manual_overrides = load_json_param("ov")
-
-saved_cfg = load_json_param("cfg")
+# 주소창에 남아 있을 수 있는 기존 쿼리 파라미터 정리
+if st.query_params:
+    st.query_params.clear()
 
 try:
     raw_df = load_upro_data()
@@ -331,19 +311,67 @@ min_db_date = raw_df.iloc[0]["Date"].date()
 max_db_date = raw_df.iloc[-1]["Date"].date()
 st.caption(f"야후 파이낸스 UPRO 실시간 연동 · 기준일: {latest_db_date}")
 
+# 세션 상태 초기화
+if "manual_overrides" not in st.session_state:
+    st.session_state.manual_overrides = {}
+
+DEFAULT_CFG = {
+    "start_date": max_db_date.isoformat(),
+    "initial_shares": 0,
+    "initial_cash": 0,
+    "buy_band_pct": -5.0,
+    "sell_band_pct": 5.0,
+    "buy_steps": 5,
+    "sell_steps": 4,
+    "rebalance_months": 12,
+    "stock_ratio_pct": 50,
+    "use_ma200": True,
+    "fx_rate": 1350,
+    "sgov_rate_pct": 4.5,
+    "monthly_deposit": 0,
+}
+
+if "saved_cfg" not in st.session_state:
+    st.session_state.saved_cfg = DEFAULT_CFG.copy()
+
+if "uploader_key" not in st.session_state:
+    st.session_state.uploader_key = 0
+
 tab_order, tab_cfg, tab_stats = st.tabs(["📋 실전 주문서", "⚙️ 내 투자 설정", "📊 성과 및 기록"])
 
 with tab_cfg:
-    st.subheader("내 계좌 및 전략 파라미터")
-    st.caption("설정을 변경하면 URL에 자동 기록되어 새로고침해도 유지됩니다.")
+    st.subheader("💾 설정 및 매매기록 백업 / 불러오기")
+    st.caption("주소창은 고정된 상태로 유지되며, 설정 파일(.json)로 언제든 내 환경을 저장하고 불러올 수 있습니다.")
 
-    default_start = max_db_date
-    if "sd" in saved_cfg:
+    uploaded_file = st.file_uploader(
+        "저장된 설정 파일 불러오기 (.json)",
+        type=["json"],
+        key=f"cfg_uploader_{st.session_state.uploader_key}",
+    )
+    if uploaded_file is not None:
         try:
-            parsed_sd = datetime.date.fromisoformat(saved_cfg["sd"])
-            default_start = min(max(parsed_sd, min_db_date), max_db_date)
-        except Exception:
-            pass
+            loaded_data = json.load(uploaded_file)
+            if "cfg" in loaded_data:
+                merged = DEFAULT_CFG.copy()
+                merged.update(loaded_data["cfg"])
+                st.session_state.saved_cfg = merged
+            if "overrides" in loaded_data:
+                st.session_state.manual_overrides = loaded_data["overrides"]
+            st.session_state.uploader_key += 1
+            st.success("설정 및 매매 기록을 성공적으로 불러왔습니다!")
+            st.rerun()
+        except Exception as e:
+            st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+
+    st.divider()
+    st.subheader("내 계좌 및 전략 파라미터")
+
+    cfg = st.session_state.saved_cfg
+    try:
+        parsed_sd = datetime.date.fromisoformat(cfg["start_date"])
+        default_start = min(max(parsed_sd, min_db_date), max_db_date)
+    except Exception:
+        default_start = max_db_date
 
     start_date = st.date_input(
         "투자 시작일",
@@ -353,68 +381,69 @@ with tab_cfg:
     )
 
     c1, c2 = st.columns(2)
-    initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(saved_cfg.get("sh", 0)), step=1)
-    initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(saved_cfg.get("ca", 0)), step=500000)
+    initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(cfg["initial_shares"]), step=1)
+    initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(cfg["initial_cash"]), step=500000)
 
     c3, c4 = st.columns(2)
-    buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(saved_cfg.get("bb", -5.0)), step=1.0)
-    sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=float(saved_cfg.get("sb", 5.0)), step=1.0)
+    buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(cfg["buy_band_pct"]), step=1.0)
+    sell_band_pct = c4.number_input("매도 밴드 (전주 고가 %)", value=float(cfg["sell_band_pct"]), step=1.0)
 
     c5, c6 = st.columns(2)
-    buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=int(saved_cfg.get("bs", 5)), step=1)
-    sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=int(saved_cfg.get("ss", 4)), step=1)
+    buy_steps = c5.number_input("매수 분할 횟수", min_value=1, max_value=20, value=int(cfg["buy_steps"]), step=1)
+    sell_steps = c6.number_input("매도 분할 횟수", min_value=1, max_value=20, value=int(cfg["sell_steps"]), step=1)
 
     c7, c8 = st.columns(2)
-    rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=int(saved_cfg.get("rm", 12)), step=1)
-    stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=int(saved_cfg.get("sr", 50)), step=5)
+    rebalance_months = c7.number_input("정기 리밸런싱 주기 (개월)", min_value=0, max_value=60, value=int(cfg["rebalance_months"]), step=1)
+    stock_ratio_pct = c8.number_input("리밸런싱 주식 비중 (%)", min_value=0, max_value=100, value=int(cfg["stock_ratio_pct"]), step=5)
 
     c9, c10 = st.columns(2)
-    ma200_idx = 0 if saved_cfg.get("ma", True) else 1
+    ma200_idx = 0 if cfg["use_ma200"] else 1
     use_ma200 = c9.selectbox("200일선 상향 돌파 매수", options=[True, False], index=ma200_idx, format_func=lambda x: "사용함" if x else "미사용")
-    fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=int(saved_cfg.get("fx", 1350)), step=10)
+    fx_rate = c10.number_input("적용 환율 (원/$)", min_value=900, max_value=2000, value=int(cfg["fx_rate"]), step=10)
 
     c11, c12 = st.columns(2)
-    sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(saved_cfg.get("sg", 4.5)), step=0.1)
-    monthly_deposit = c12.number_input("월별 적립금 (원)", min_value=0, value=int(saved_cfg.get("md", 0)), step=100000)
+    sgov_rate_pct = c11.number_input("예수금 연이자율 (%)", min_value=0.0, max_value=15.0, value=float(cfg["sgov_rate_pct"]), step=0.1)
+    monthly_deposit = c12.number_input("월별 적립금 (원)", min_value=0, value=int(cfg["monthly_deposit"]), step=100000)
 
-    # 기본값과 다른 항목만 압축해 URL(cfg)에 자동 저장
-    defaults = {
-        "sd": max_db_date.isoformat(),
-        "sh": 0,
-        "ca": 0,
-        "bb": -5.0,
-        "sb": 5.0,
-        "bs": 5,
-        "ss": 4,
-        "rm": 12,
-        "sr": 50,
-        "ma": True,
-        "fx": 1350,
-        "sg": 4.5,
-        "md": 0,
-    }
+    # 현재 입력된 설정 동기화
     current_cfg = {
-        "sd": start_date.isoformat(),
-        "sh": int(initial_shares),
-        "ca": int(initial_cash),
-        "bb": float(buy_band_pct),
-        "sb": float(sell_band_pct),
-        "bs": int(buy_steps),
-        "ss": int(sell_steps),
-        "rm": int(rebalance_months),
-        "sr": int(stock_ratio_pct),
-        "ma": bool(use_ma200),
-        "fx": int(fx_rate),
-        "sg": float(sgov_rate_pct),
-        "md": int(monthly_deposit),
+        "start_date": start_date.isoformat(),
+        "initial_shares": int(initial_shares),
+        "initial_cash": int(initial_cash),
+        "buy_band_pct": float(buy_band_pct),
+        "sell_band_pct": float(sell_band_pct),
+        "buy_steps": int(buy_steps),
+        "sell_steps": int(sell_steps),
+        "rebalance_months": int(rebalance_months),
+        "stock_ratio_pct": int(stock_ratio_pct),
+        "use_ma200": bool(use_ma200),
+        "fx_rate": int(fx_rate),
+        "sgov_rate_pct": float(sgov_rate_pct),
+        "monthly_deposit": int(monthly_deposit),
     }
-    diff_cfg = {k: v for k, v in current_cfg.items() if v != defaults[k]}
-    save_json_param("cfg", diff_cfg)
+    st.session_state.saved_cfg = current_cfg
 
-    if diff_cfg:
-        if st.button("🔄 투자 설정 기본값으로 초기화", use_container_width=True):
-            save_json_param("cfg", {})
-            st.rerun()
+    export_payload = json.dumps(
+        {
+            "cfg": current_cfg,
+            "overrides": st.session_state.manual_overrides,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+
+    st.download_button(
+        label="📥 현재 설정 및 매매기록 파일로 저장 (.json)",
+        data=export_payload,
+        file_name=f"upro_snowball_{latest_db_date}.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    if st.button("🔄 모든 설정 및 기록 초기화", use_container_width=True):
+        st.session_state.saved_cfg = DEFAULT_CFG.copy()
+        st.session_state.manual_overrides = {}
+        st.rerun()
 
 res = run_upro_simulation(
     raw_df=raw_df,
@@ -479,7 +508,7 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption("증권사 계좌에서 실제 매매 체결 후 수량과 예수금을 입력하면 URL에 자동 저장되어 새로고침해도 유지됩니다.")
+    st.caption("실제 매매 체결 후 수량과 예수금을 반영한 뒤 [⚙️ 내 투자 설정] 탭에서 파일로 저장해 두시면 언제든 불러올 수 있습니다.")
 
     with st.form("manual_trade_form"):
         m_date = st.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
@@ -492,13 +521,11 @@ with tab_order:
                 "shares": m_shares,
                 "cash": m_cash,
             }
-            save_json_param("ov", st.session_state.manual_overrides)
             st.rerun()
 
     if st.session_state.manual_overrides:
         if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
             st.session_state.manual_overrides = {}
-            save_json_param("ov", {})
             st.rerun()
 
 with tab_stats:
