@@ -213,7 +213,6 @@ def run_upro_simulation(
             exact_prev_low = weekly_stats[prev_wk]["Low"]
 
     shares = int(initial_shares)
-    # 원화 예수금과 달러 예수금(원화 환산) 합산 운용
     cash = float(initial_cash_krw) + (float(initial_cash_usd) * fx_rate)
     initial_total_cash_krw = cash
 
@@ -228,6 +227,7 @@ def run_upro_simulation(
     has_triggered_ma200 = False
     total_extra_injected = 0.0
     total_monthly_injected = 0.0
+    total_manual_principal_delta = 0.0  # 수동 입출금/보정으로 추가된 원금 변동 누적
     total_withdrawal = 0.0
 
     cur_week = first_week
@@ -239,6 +239,7 @@ def run_upro_simulation(
     prev_month = last_reb_month
 
     records = []
+    auto_events = []  # 자동 체결 내역 추적용
 
     for i, row in df.iterrows():
         dt = row["Date"]
@@ -259,7 +260,8 @@ def run_upro_simulation(
             cur_week_high = max(cur_week_high, high)
             cur_week_low = min(cur_week_low, low)
 
-        cash += cash * daily_interest
+        if i > 0:
+            cash += cash * daily_interest
 
         day_actions = []
         if dt.month != prev_month:
@@ -285,42 +287,70 @@ def run_upro_simulation(
 
         trade_note = ""
 
-        # 수동 실전 잔고 반영 (원화 + 달러 예수금 지원 및 기존 단일 cash 데이터 호환)
+        # 1. 사용자가 수정(덮어쓰기) 또는 수동 입력한 날짜
         if date_str in manual_overrides:
             ov = manual_overrides[date_str]
-            new_shares = int(ov["shares"])
-            ov_krw = float(ov.get("cash_krw", ov.get("cash", 0)))
-            ov_usd = float(ov.get("cash_usd", 0.0))
-            new_cash = ov_krw + (ov_usd * fx_rate)
+            action_type = ov.get("action", "auto")
 
-            cash_desc = f"{ov_krw:,.0f}원 + ${ov_usd:,.2f}" if ov_usd > 0 else f"{ov_krw:,.0f}원"
-
-            if new_shares > shares:
-                disp_step = min(buy_step, buy_steps)
-                trade_note = f"✏️ 실전 매수 {disp_step}단계 반영 ({new_shares:,}주 / {cash_desc})"
-                buy_step = min(buy_steps + 1, buy_step + 1)
-                sell_step = 1
-                last_traded_week = week_num
-            elif new_shares < shares:
-                trade_note = f"✏️ 실전 매도 {sell_step}회차 반영 ({new_shares:,}주 / {cash_desc})"
-                if new_shares == 0:
-                    sell_step = 1
-                else:
-                    sell_step = 1 if sell_step >= sell_steps else sell_step + 1
-                buy_step = 1
-                has_triggered_ma200 = False
-                last_traded_week = week_num
+            if action_type == "skip":
+                trade_note = "🚫 미체결 처리 (자동 체결 건너뜀)"
             else:
-                trade_note = f"✏️ 실전 반영 ({new_shares:,}주 / {cash_desc})"
+                prev_tot_val = cash + (shares * close * fx_rate)
+                new_shares = int(ov["shares"])
+                ov_krw = float(ov.get("cash_krw", ov.get("cash", 0)))
+                ov_usd = float(ov.get("cash_usd", 0.0))
+                new_cash = ov_krw + (ov_usd * fx_rate)
+                new_tot_val = new_cash + (new_shares * close * fx_rate)
 
-            shares = new_shares
-            cash = new_cash
-        else:
+                cash_desc = f"{ov_krw:,.0f}원 + ${ov_usd:,.2f}" if ov_usd > 0 else f"{ov_krw:,.0f}원"
+
+                if action_type == "deposit":
+                    delta_val = new_tot_val - prev_tot_val
+                    total_manual_principal_delta += delta_val
+                    sign = "+" if delta_val >= 0 else ""
+                    trade_note = f"💵 입출금 원금반영 ({sign}{delta_val:,.0f}원 → {new_shares:,}주 / {cash_desc})"
+                elif action_type == "buy" or (action_type == "auto" and new_shares > shares):
+                    if prev_tot_val == 0 and new_tot_val > 0:
+                        total_manual_principal_delta += new_tot_val
+                    disp_step = min(buy_step, buy_steps)
+                    trade_note = f"✏️ 실전 매수 {disp_step}단계 반영 ({new_shares:,}주 / {cash_desc})"
+                    buy_step = min(buy_steps + 1, buy_step + 1)
+                    sell_step = 1
+                    last_traded_week = week_num
+                elif action_type == "sell" or (action_type == "auto" and new_shares < shares):
+                    trade_note = f"✏️ 실전 매도 {sell_step}회차 반영 ({new_shares:,}주 / {cash_desc})"
+                    if new_shares == 0:
+                        sell_step = 1
+                    else:
+                        sell_step = 1 if sell_step >= sell_steps else sell_step + 1
+                    buy_step = 1
+                    has_triggered_ma200 = False
+                    last_traded_week = week_num
+                elif action_type == "rebal":
+                    trade_note = f"⚖️ 실전 리밸런싱 ({new_shares:,}주 / {cash_desc})"
+                    buy_step = 1
+                    sell_step = 1
+                    has_triggered_ma200 = False
+                    last_traded_week = week_num
+                else:
+                    delta_val = new_tot_val - prev_tot_val
+                    if abs(delta_val) >= 1000:
+                        total_manual_principal_delta += delta_val
+                        sign = "+" if delta_val >= 0 else ""
+                        trade_note = f"✏️ 실전 잔고·원금 반영 ({sign}{delta_val:,.0f}원 · {new_shares:,}주 / {cash_desc})"
+                    else:
+                        trade_note = f"✏️ 실전 잔고 보정 ({new_shares:,}주 / {cash_desc})"
+
+                shares = new_shares
+                cash = new_cash
+
+        # 2. 수정되지 않은 날짜는 계속 자동 체결 엔진 작동
+        elif i > 0:
             target_buy = exact_prev_low * buy_band
             target_sell = exact_prev_high * sell_band
 
             is_cross_ma200 = False
-            if use_ma200 and i > 0 and not has_triggered_ma200 and buy_step == 1:
+            if use_ma200 and not has_triggered_ma200 and buy_step == 1:
                 prev_row = df.iloc[i - 1]
                 if pd.notna(prev_row["MA200"]) and pd.notna(ma200):
                     if prev_row["Close"] <= prev_row["MA200"] and close > ma200:
@@ -339,6 +369,13 @@ def run_upro_simulation(
                     last_reb_month = dt.month
                     last_traded_week = week_num
                     trade_note = f"⚖️ 정기 리밸런싱({int(stock_ratio_pct)}:{int(100 - stock_ratio_pct)})"
+                    auto_events.append({
+                        "date": date_str,
+                        "note": trade_note,
+                        "shares": shares,
+                        "cash": round(cash),
+                        "action": "rebal",
+                    })
 
             if trade_note == "" and week_num != last_traded_week:
                 is_grid_buy = low <= target_buy
@@ -360,6 +397,13 @@ def run_upro_simulation(
                             has_triggered_ma200 = True
                         reason = "200일선 돌파" if is_cross_ma200 else f"목표가 ${target_buy:.2f}"
                         trade_note = f"🟢 매수 {buy_step}단계 ({bought}주 · {reason})"
+                        auto_events.append({
+                            "date": date_str,
+                            "note": trade_note,
+                            "shares": shares,
+                            "cash": round(cash),
+                            "action": "buy",
+                        })
                         buy_step += 1
                         sell_step = 1
                         last_traded_week = week_num
@@ -371,6 +415,13 @@ def run_upro_simulation(
                         shares -= sold
                         cash += sold * target_sell * fx_rate
                         trade_note = f"🔴 매도 {sell_step}회차 ({sold}주 · 목표가 ${target_sell:.2f})"
+                        auto_events.append({
+                            "date": date_str,
+                            "note": trade_note,
+                            "shares": shares,
+                            "cash": round(cash),
+                            "action": "sell",
+                        })
                         last_traded_week = week_num
                         sell_step = 1 if sell_step >= sell_steps else sell_step + 1
                         buy_step = 1
@@ -420,7 +471,6 @@ def run_upro_simulation(
     next_buy_price = ref_low * buy_band
     next_sell_price = ref_high * sell_band
 
-    # ZeroDivisionError 방지
     if buy_step <= buy_steps and next_buy_price > 0:
         next_buy_amt = cash * (1.0 / (buy_steps - buy_step + 1))
         next_buy_qty = max(0, int(np.floor(next_buy_amt / (next_buy_price * fx_rate))))
@@ -430,7 +480,14 @@ def run_upro_simulation(
     next_sell_frac = 1.0 if (sell_step == sell_steps or sell_steps == 1) else (1.0 / (sell_steps - sell_step + 1))
     next_sell_qty = max(0, int(np.floor(shares * next_sell_frac)))
 
-    principal = (initial_shares * first_price * fx_rate) + initial_total_cash_krw + total_monthly_injected + total_extra_injected
+    principal = (
+        (initial_shares * first_price * fx_rate)
+        + initial_total_cash_krw
+        + total_monthly_injected
+        + total_extra_injected
+        + total_manual_principal_delta
+    )
+    principal = max(0.0, principal)
     final_asset = res_df.iloc[-1]["실질총자산(원)"]
     total_ret = ((final_asset - principal) / principal * 100.0) if principal > 0 else 0.0
     days = (df.iloc[-1]["Date"] - df.iloc[0]["Date"]).days
@@ -453,6 +510,7 @@ def run_upro_simulation(
         "total_ret": total_ret,
         "cagr": cagr,
         "mdd": mdd,
+        "auto_events": auto_events,
     }
 
 
@@ -473,8 +531,8 @@ st.caption(f"야후 파이낸스 UPRO 실시간 연동 · 기준일: {latest_db_
 DEFAULT_CFG = {
     "sd": max_db_date.isoformat(),
     "sh": 0,
-    "ca": 0,      # 초기 원화 예수금 (기존 데이터 호환)
-    "ca_usd": 0.0,  # 초기 달러 예수금
+    "ca": 0,
+    "ca_usd": 0.0,
     "bb": -5.0,
     "sb": 5.0,
     "bs": 5,
@@ -727,18 +785,26 @@ res = run_upro_simulation(
 )
 
 latest_row = res["df"].iloc[-1]
+auto_events = res["auto_events"]
 
-# 실전 잔고 입력 폼 기본값 (가장 최근 수동 입력 기록이 있으면 분리된 원/달러 표시, 없으면 합산 예수금 표시)
+# 실전 잔고 입력 폼 기본값 (최근 자동 체결일 우선 제안 → 수동 기록 → 최신 잔고 순)
+default_m_date = datetime.date.fromisoformat(latest_row["날짜"])
 default_m_shares = int(latest_row["보유수량"])
 default_m_krw = int(latest_row["예수금합계(원)"])
 default_m_usd = 0.0
 
-if st.session_state.manual_overrides:
+if auto_events:
+    last_ev = auto_events[-1]
+    default_m_date = datetime.date.fromisoformat(last_ev["date"])
+    default_m_shares = int(last_ev["shares"])
+    default_m_krw = int(last_ev["cash"])
+elif st.session_state.manual_overrides:
     last_ov_key = max(st.session_state.manual_overrides.keys())
-    if last_ov_key == latest_row["날짜"]:
-        last_ov = st.session_state.manual_overrides[last_ov_key]
-        default_m_krw = int(last_ov.get("cash_krw", last_ov.get("cash", 0)))
-        default_m_usd = float(last_ov.get("cash_usd", 0.0))
+    last_ov = st.session_state.manual_overrides[last_ov_key]
+    default_m_date = datetime.date.fromisoformat(last_ov_key)
+    default_m_shares = int(last_ov.get("shares", default_m_shares))
+    default_m_krw = int(last_ov.get("cash_krw", last_ov.get("cash", 0)))
+    default_m_usd = float(last_ov.get("cash_usd", 0.0))
 elif len(res["df"]) == 1 and initial_cash_usd > 0:
     default_m_krw = int(initial_cash_krw)
     default_m_usd = float(initial_cash_usd)
@@ -794,24 +860,47 @@ with tab_order:
         )
 
     st.divider()
-    st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption(f"체결 후 증권사 계좌의 보유 수량과 원화·달러 예수금을 각각 입력하면 자동 합산(환율 {fx_rate:,}원)되어 저장됩니다.")
+    st.subheader("✏️ 자동 체결 내역 수정 및 실전 잔고 반영")
+    st.caption(f"자동 체결일을 덮어쓰거나 추가 입금·실전 잔고를 입력하면 원금과 성과에 자동 반영됩니다. (환율 {fx_rate:,}원)")
+
+    if auto_events:
+        last_ev = auto_events[-1]
+        st.info(f"💡 최근 자동 체결 감지: **{last_ev['date']}** ({last_ev['note']}) — 해당 날짜로 아래 값을 수정하면 중복 없이 덮어씁니다.")
 
     with st.form("manual_trade_form"):
         fc1, fc2 = st.columns(2)
-        m_date = fc1.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
-        m_shares = fc2.number_input("실제 보유 수량 (주)", min_value=0, value=default_m_shares, step=1)
+        m_date = fc1.date_input(
+            "체결 기준일",
+            value=default_m_date,
+            min_value=min_db_date,
+            max_value=max_db_date,
+        )
+        m_action = fc2.selectbox(
+            "체결 구분",
+            options=["auto", "deposit", "buy", "sell", "rebal", "skip", "adjust"],
+            format_func=lambda x: {
+                "auto": "자동판별 (증감반영)",
+                "deposit": "💵 입출금 (원금반영)",
+                "buy": "🟢 매수체결 (덮어쓰기)",
+                "sell": "🔴 매도체결 (덮어쓰기)",
+                "rebal": "⚖️ 리밸런싱",
+                "skip": "🚫 미체결 (자동취소)",
+                "adjust": "🔧 단순 잔고보정",
+            }[x],
+        )
 
-        mc1, mc2 = st.columns(2)
-        m_cash_krw = mc1.number_input("실제 원화 예수금 (원)", min_value=0, value=default_m_krw, step=10000)
-        m_cash_usd = mc2.number_input("실제 달러 예수금 ($)", min_value=0.0, value=default_m_usd, step=10.0, format="%.2f")
+        mc1, mc2, mc3 = st.columns(3)
+        m_shares = mc1.number_input("실제 보유 수량(주)", min_value=0, value=default_m_shares, step=1)
+        m_cash_krw = mc2.number_input("원화 예수금(원)", min_value=0, value=default_m_krw, step=10000)
+        m_cash_usd = mc3.number_input("달러 예수금($)", min_value=0.0, value=default_m_usd, step=10.0, format="%.2f")
 
-        submitted = st.form_submit_button("💾 실전 잔고 적용하기", use_container_width=True)
+        submitted = st.form_submit_button("💾 수정 / 실전 잔고 적용하기", use_container_width=True)
         if submitted:
             st.session_state.manual_overrides[m_date.strftime("%Y-%m-%d")] = {
                 "shares": int(m_shares),
                 "cash_krw": int(m_cash_krw),
                 "cash_usd": float(m_cash_usd),
+                "action": m_action,
             }
             if st.session_state.logged_user:
                 new_sha, err = save_user_to_github(
@@ -830,18 +919,42 @@ with tab_order:
                 st.rerun()
 
     if st.session_state.manual_overrides:
-        if st.button("🗑️ 수동 입력 기록 초기화", use_container_width=True):
-            st.session_state.manual_overrides = {}
-            if st.session_state.logged_user:
-                new_sha, _ = save_user_to_github(
-                    st.session_state.logged_user,
-                    st.session_state.pin_hash,
-                    st.session_state.saved_cfg,
-                    {},
-                    st.session_state.file_sha,
+        with st.expander("📝 수동 수정된 내역 관리 (개별 복구 가능)", expanded=False):
+            for d_str in sorted(st.session_state.manual_overrides.keys(), reverse=True):
+                item = st.session_state.manual_overrides[d_str]
+                krw_val = item.get("cash_krw", item.get("cash", 0))
+                usd_val = item.get("cash_usd", 0.0)
+                act_val = item.get("action", "auto")
+                c_info, c_del = st.columns([4, 1])
+                c_info.write(
+                    f"**{d_str}** · {item.get('shares', 0)}주 · "
+                    f"{krw_val:,}원 / ${usd_val:.2f} ({act_val})"
                 )
-                st.session_state.file_sha = new_sha
-            st.rerun()
+                if c_del.button("삭제", key=f"del_{d_str}"):
+                    del st.session_state.manual_overrides[d_str]
+                    if st.session_state.logged_user:
+                        new_sha, _ = save_user_to_github(
+                            st.session_state.logged_user,
+                            st.session_state.pin_hash,
+                            st.session_state.saved_cfg,
+                            st.session_state.manual_overrides,
+                            st.session_state.file_sha,
+                        )
+                        st.session_state.file_sha = new_sha
+                    st.rerun()
+
+            if st.button("🗑️ 모든 수동 수정 기록 초기화 (100% 자동 시뮬레이션 복귀)", use_container_width=True):
+                st.session_state.manual_overrides = {}
+                if st.session_state.logged_user:
+                    new_sha, _ = save_user_to_github(
+                        st.session_state.logged_user,
+                        st.session_state.pin_hash,
+                        st.session_state.saved_cfg,
+                        {},
+                        st.session_state.file_sha,
+                    )
+                    st.session_state.file_sha = new_sha
+                st.rerun()
 
 with tab_stats:
     m1, m2 = st.columns(2)
