@@ -1,7 +1,7 @@
 {
   "username": "furia",
   "pin_hash": "fd68fcf88c30b4df82ec214bb6b559ede1a5d47f3b1f751524177b998bb6bbdd",
-  "updated_at": "2026-11-18 10:35:40",
+  "updated_at": "2026-11-18 10:37:07",
   "cfg": {
     "sd": "2026-11-17",
     "sh": 0,
@@ -23,5 +23,12 @@
     "ea": 0,
     "es": 0
   },
-  "overrides": {}
+  "overrides": {
+    "2026-11-16": {
+      "shares": 1,
+      "cash_krw": 1,
+      "cash_usd": 623.62,
+      "action": "auto"
+    }
+  }
 }
