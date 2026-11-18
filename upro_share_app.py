@@ -118,6 +118,16 @@ def save_user_to_github(username: str, pin_hash: str, cfg: dict, overrides: dict
     if put_res.status_code in (200, 201):
         new_sha = put_res.json().get("content", {}).get("sha")
         return new_sha, None
+    elif put_res.status_code == 409:
+        # 다중 기기 충돌 시 최신 sha 재조회 후 1회 재시도
+        check_res = requests.get(url, headers=headers, timeout=10)
+        if check_res.status_code == 200:
+            latest_sha = check_res.json().get("sha")
+            body["sha"] = latest_sha
+            retry_res = requests.put(url, headers=headers, json=body, timeout=10)
+            if retry_res.status_code in (200, 201):
+                return retry_res.json().get("content", {}).get("sha"), None
+        return sha, f"GitHub 저장 충돌 오류 ({put_res.status_code}): 다시 시도해 주세요."
     else:
         return sha, f"GitHub 저장 실패 ({put_res.status_code}): {put_res.text}"
 
@@ -143,7 +153,8 @@ def run_upro_simulation(
     raw_df: pd.DataFrame,
     start_date: datetime.date,
     initial_shares: int,
-    initial_cash: float,
+    initial_cash_krw: float,
+    initial_cash_usd: float,
     buy_band_pct: float,
     sell_band_pct: float,
     buy_steps: int,
@@ -171,7 +182,7 @@ def run_upro_simulation(
     all_weeks = sorted(weekly_stats.keys())
 
     effective_start = start_date
-    if initial_shares == 0 and initial_cash == 0 and manual_overrides:
+    if initial_shares == 0 and initial_cash_krw == 0 and initial_cash_usd == 0 and manual_overrides:
         earliest_ov_date = datetime.date.fromisoformat(min(manual_overrides.keys()))
         if earliest_ov_date < effective_start:
             effective_start = earliest_ov_date
@@ -202,7 +213,10 @@ def run_upro_simulation(
             exact_prev_low = weekly_stats[prev_wk]["Low"]
 
     shares = int(initial_shares)
-    cash = float(initial_cash)
+    # 원화 예수금과 달러 예수금(원화 환산) 합산 운용
+    cash = float(initial_cash_krw) + (float(initial_cash_usd) * fx_rate)
+    initial_total_cash_krw = cash
+
     buy_band = 1.0 + (buy_band_pct / 100.0)
     sell_band = 1.0 + (sell_band_pct / 100.0)
     daily_interest = (sgov_rate_pct / 100.0) / 252.0
@@ -271,19 +285,24 @@ def run_upro_simulation(
 
         trade_note = ""
 
-        # 수동 실전 잔고 반영 + 매수/매도 분할 단계 자동 보정
+        # 수동 실전 잔고 반영 (원화 + 달러 예수금 지원 및 기존 단일 cash 데이터 호환)
         if date_str in manual_overrides:
             ov = manual_overrides[date_str]
             new_shares = int(ov["shares"])
-            new_cash = float(ov["cash"])
+            ov_krw = float(ov.get("cash_krw", ov.get("cash", 0)))
+            ov_usd = float(ov.get("cash_usd", 0.0))
+            new_cash = ov_krw + (ov_usd * fx_rate)
+
+            cash_desc = f"{ov_krw:,.0f}원 + ${ov_usd:,.2f}" if ov_usd > 0 else f"{ov_krw:,.0f}원"
 
             if new_shares > shares:
-                trade_note = f"✏️ 실전 매수 {buy_step}단계 반영 ({new_shares:,}주 / {new_cash:,.0f}원)"
-                buy_step = min(buy_steps, buy_step + 1)
+                disp_step = min(buy_step, buy_steps)
+                trade_note = f"✏️ 실전 매수 {disp_step}단계 반영 ({new_shares:,}주 / {cash_desc})"
+                buy_step = min(buy_steps + 1, buy_step + 1)
                 sell_step = 1
                 last_traded_week = week_num
             elif new_shares < shares:
-                trade_note = f"✏️ 실전 매도 {sell_step}회차 반영 ({new_shares:,}주 / {new_cash:,.0f}원)"
+                trade_note = f"✏️ 실전 매도 {sell_step}회차 반영 ({new_shares:,}주 / {cash_desc})"
                 if new_shares == 0:
                     sell_step = 1
                 else:
@@ -292,7 +311,7 @@ def run_upro_simulation(
                 has_triggered_ma200 = False
                 last_traded_week = week_num
             else:
-                trade_note = f"✏️ 실전 반영 ({new_shares:,}주 / {new_cash:,.0f}원)"
+                trade_note = f"✏️ 실전 반영 ({new_shares:,}주 / {cash_desc})"
 
             shares = new_shares
             cash = new_cash
@@ -368,7 +387,7 @@ def run_upro_simulation(
                 "날짜": date_str,
                 "종가($)": round(close, 2),
                 "보유수량": shares,
-                "예수금(원)": round(cash),
+                "예수금합계(원)": round(cash),
                 "계좌잔고(원)": round(total_val),
                 "누적인출(원)": round(total_withdrawal),
                 "실질총자산(원)": round(real_total_val),
@@ -400,12 +419,18 @@ def run_upro_simulation(
 
     next_buy_price = ref_low * buy_band
     next_sell_price = ref_high * sell_band
-    next_buy_amt = cash * (1.0 / (buy_steps - buy_step + 1))
-    next_buy_qty = max(0, int(np.floor(next_buy_amt / (next_buy_price * fx_rate))))
+
+    # ZeroDivisionError 방지
+    if buy_step <= buy_steps and next_buy_price > 0:
+        next_buy_amt = cash * (1.0 / (buy_steps - buy_step + 1))
+        next_buy_qty = max(0, int(np.floor(next_buy_amt / (next_buy_price * fx_rate))))
+    else:
+        next_buy_qty = 0
+
     next_sell_frac = 1.0 if (sell_step == sell_steps or sell_steps == 1) else (1.0 / (sell_steps - sell_step + 1))
     next_sell_qty = max(0, int(np.floor(shares * next_sell_frac)))
 
-    principal = (initial_shares * first_price * fx_rate) + initial_cash + total_monthly_injected + total_extra_injected
+    principal = (initial_shares * first_price * fx_rate) + initial_total_cash_krw + total_monthly_injected + total_extra_injected
     final_asset = res_df.iloc[-1]["실질총자산(원)"]
     total_ret = ((final_asset - principal) / principal * 100.0) if principal > 0 else 0.0
     days = (df.iloc[-1]["Date"] - df.iloc[0]["Date"]).days
@@ -448,7 +473,8 @@ st.caption(f"야후 파이낸스 UPRO 실시간 연동 · 기준일: {latest_db_
 DEFAULT_CFG = {
     "sd": max_db_date.isoformat(),
     "sh": 0,
-    "ca": 0,
+    "ca": 0,      # 초기 원화 예수금 (기존 데이터 호환)
+    "ca_usd": 0.0,  # 초기 달러 예수금
     "bb": -5.0,
     "sb": 5.0,
     "bs": 5,
@@ -576,16 +602,18 @@ with tab_cfg:
         default_start = max_db_date
 
     with st.form("strategy_cfg_form"):
-        start_date = st.date_input(
+        c0_1, c0_2 = st.columns(2)
+        start_date = c0_1.date_input(
             "투자 시작일",
             value=default_start,
             min_value=min_db_date,
             max_value=max_db_date,
         )
+        initial_shares = c0_2.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(saved_cfg["sh"]), step=1)
 
         c1, c2 = st.columns(2)
-        initial_shares = c1.number_input("초기 UPRO 수량 (주)", min_value=0, value=int(saved_cfg["sh"]), step=1)
-        initial_cash = c2.number_input("초기 예수금 (원)", min_value=0, value=int(saved_cfg["ca"]), step=500000)
+        initial_cash_krw = c1.number_input("초기 원화 예수금 (원)", min_value=0, value=int(saved_cfg.get("ca", 0)), step=500000)
+        initial_cash_usd = c2.number_input("초기 달러 예수금 ($)", min_value=0.0, value=float(saved_cfg.get("ca_usd", 0.0)), step=100.0, format="%.2f")
 
         c3, c4 = st.columns(2)
         buy_band_pct = c3.number_input("매수 밴드 (전주 저가 %)", value=float(saved_cfg["bb"]), step=1.0)
@@ -621,7 +649,8 @@ with tab_cfg:
             new_cfg = {
                 "sd": start_date.isoformat(),
                 "sh": int(initial_shares),
-                "ca": int(initial_cash),
+                "ca": int(initial_cash_krw),
+                "ca_usd": float(initial_cash_usd),
                 "bb": float(buy_band_pct),
                 "sb": float(sell_band_pct),
                 "bs": int(buy_steps),
@@ -678,7 +707,8 @@ res = run_upro_simulation(
     raw_df=raw_df,
     start_date=start_date,
     initial_shares=initial_shares,
-    initial_cash=initial_cash,
+    initial_cash_krw=initial_cash_krw,
+    initial_cash_usd=initial_cash_usd,
     buy_band_pct=buy_band_pct,
     sell_band_pct=sell_band_pct,
     buy_steps=buy_steps,
@@ -698,13 +728,28 @@ res = run_upro_simulation(
 
 latest_row = res["df"].iloc[-1]
 
+# 실전 잔고 입력 폼 기본값 (가장 최근 수동 입력 기록이 있으면 분리된 원/달러 표시, 없으면 합산 예수금 표시)
+default_m_shares = int(latest_row["보유수량"])
+default_m_krw = int(latest_row["예수금합계(원)"])
+default_m_usd = 0.0
+
+if st.session_state.manual_overrides:
+    last_ov_key = max(st.session_state.manual_overrides.keys())
+    if last_ov_key == latest_row["날짜"]:
+        last_ov = st.session_state.manual_overrides[last_ov_key]
+        default_m_krw = int(last_ov.get("cash_krw", last_ov.get("cash", 0)))
+        default_m_usd = float(last_ov.get("cash_usd", 0.0))
+elif len(res["df"]) == 1 and initial_cash_usd > 0:
+    default_m_krw = int(initial_cash_krw)
+    default_m_usd = float(initial_cash_usd)
+
 with tab_order:
     st.markdown(
         f"""
         <div class="order-card">
             <div style="display:flex; justify-content:space-between; color:#6c757d; font-size:0.85rem; margin-bottom:4px;">
                 <span>UPRO 최근 종가 ({latest_row['날짜']})</span>
-                <span>보유 {latest_row['보유수량']:,}주 · 예수금 {latest_row['예수금(원)']:,}원</span>
+                <span>보유 {latest_row['보유수량']:,}주 · 예수금 {latest_row['예수금합계(원)']:,}원</span>
             </div>
             <div style="font-size:2rem; font-weight:800; margin-bottom:8px;">${latest_row['종가($)']:.2f}</div>
             <div class="guide-banner">
@@ -715,6 +760,13 @@ with tab_order:
         unsafe_allow_html=True,
     )
 
+    buy_est_usd = res["next_buy_price"] * res["next_buy_qty"]
+    buy_est_krw = round(buy_est_usd * fx_rate)
+    sell_est_usd = res["next_sell_price"] * res["next_sell_qty"]
+    sell_est_krw = round(sell_est_usd * fx_rate)
+
+    buy_step_label = f"{res['buy_step']}단계" if res["buy_step"] <= buy_steps else "분할완료"
+
     col_b, col_s = st.columns(2)
     with col_b:
         st.markdown(
@@ -722,7 +774,8 @@ with tab_order:
             <div class="buy-box">
                 <div style="font-size:0.8rem;">전주 저가(${res['ref_low']:.2f}) {buy_band_pct:+.0f}%</div>
                 <div style="font-size:1.5rem; font-weight:800; margin:4px 0;">${res['next_buy_price']:.2f}</div>
-                <div style="font-weight:700; font-size:0.9rem;">🛒 매수 {res['next_buy_qty']}주 ({res['buy_step']}단계)</div>
+                <div style="font-weight:700; font-size:0.9rem;">🛒 매수 {res['next_buy_qty']}주 ({buy_step_label})</div>
+                <div style="font-size:0.75rem; margin-top:4px; opacity:0.85;">예상 ${buy_est_usd:,.1f} (약 {buy_est_krw:,}원)</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -734,6 +787,7 @@ with tab_order:
                 <div style="font-size:0.8rem;">전주 고가(${res['ref_high']:.2f}) {sell_band_pct:+.0f}%</div>
                 <div style="font-size:1.5rem; font-weight:800; margin:4px 0;">${res['next_sell_price']:.2f}</div>
                 <div style="font-weight:700; font-size:0.9rem;">🎯 매도 {res['next_sell_qty']}주 ({res['sell_step']}회차)</div>
+                <div style="font-size:0.75rem; margin-top:4px; opacity:0.85;">예상 ${sell_est_usd:,.1f} (약 {sell_est_krw:,}원)</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -741,18 +795,23 @@ with tab_order:
 
     st.divider()
     st.subheader("✏️ 실전 체결 잔고 반영")
-    st.caption("실제 매매 체결 후 수량과 예수금을 적용하면 분할 단계가 자동 보정되고 클라우드에 영구 저장됩니다.")
+    st.caption(f"체결 후 증권사 계좌의 보유 수량과 원화·달러 예수금을 각각 입력하면 자동 합산(환율 {fx_rate:,}원)되어 저장됩니다.")
 
     with st.form("manual_trade_form"):
-        m_date = st.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
+        fc1, fc2 = st.columns(2)
+        m_date = fc1.date_input("체결 기준일", value=datetime.date.fromisoformat(latest_row["날짜"]))
+        m_shares = fc2.number_input("실제 보유 수량 (주)", min_value=0, value=default_m_shares, step=1)
+
         mc1, mc2 = st.columns(2)
-        m_shares = mc1.number_input("실제 보유 수량 (주)", min_value=0, value=int(latest_row["보유수량"]), step=1)
-        m_cash = mc2.number_input("실제 예수금 (원)", min_value=0, value=int(latest_row["예수금(원)"]), step=10000)
+        m_cash_krw = mc1.number_input("실제 원화 예수금 (원)", min_value=0, value=default_m_krw, step=10000)
+        m_cash_usd = mc2.number_input("실제 달러 예수금 ($)", min_value=0.0, value=default_m_usd, step=10.0, format="%.2f")
+
         submitted = st.form_submit_button("💾 실전 잔고 적용하기", use_container_width=True)
         if submitted:
             st.session_state.manual_overrides[m_date.strftime("%Y-%m-%d")] = {
-                "shares": m_shares,
-                "cash": m_cash,
+                "shares": int(m_shares),
+                "cash_krw": int(m_cash_krw),
+                "cash_usd": float(m_cash_usd),
             }
             if st.session_state.logged_user:
                 new_sha, err = save_user_to_github(
